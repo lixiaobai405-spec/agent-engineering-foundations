@@ -41,7 +41,7 @@ docs/learning-notes/01-foundations.md
 - Create: `src/agent_foundations/__init__.py`
 - Create: `tests/unit/test_package.py`
 
-- [ ] **Step 1: 写导入失败测试**
+- [x] **Step 1: 写导入失败测试**
 
 ```python
 # tests/unit/test_package.py
@@ -52,13 +52,13 @@ def test_package_exposes_version() -> None:
     assert __version__ == "0.1.0"
 ```
 
-- [ ] **Step 2: 验证测试先失败**
+- [x] **Step 2: 验证测试先失败**
 
 Run: `conda run -n agent-foundations python -m pytest tests/unit/test_package.py -v`
 
 Expected: FAIL，错误包含 `ModuleNotFoundError: No module named 'agent_foundations'`。
 
-- [ ] **Step 3: 创建项目配置与最小包**
+- [x] **Step 3: 创建项目配置与最小包**
 
 ```toml
 # pyproject.toml
@@ -123,7 +123,7 @@ Run: `conda run -n agent-foundations python -m pip install -e ".[dev]"`
 
 Expected: 安装成功，退出码为 `0`。
 
-- [ ] **Step 4: 验证测试通过**
+- [x] **Step 4: 验证测试通过**
 
 Run: `conda run -n agent-foundations python -m pytest tests/unit/test_package.py -v`
 
@@ -145,7 +145,7 @@ git commit -m "build: initialize Python agent package"
 - Create: `src/agent_foundations/domain/model.py`
 - Test: `tests/unit/domain/test_models.py`
 
-- [ ] **Step 1: 写领域模型失败测试**
+- [x] **Step 1: 写领域模型失败测试**
 
 ```python
 # tests/unit/domain/test_models.py
@@ -194,13 +194,13 @@ def test_request_contains_model_independent_tool_schema() -> None:
     assert request.tools[0].name == response.tool_calls[0].name
 ```
 
-- [ ] **Step 2: 验证领域模型尚不存在**
+- [x] **Step 2: 验证领域模型尚不存在**
 
 Run: `conda run -n agent-foundations python -m pytest tests/unit/domain/test_models.py -v`
 
 Expected: FAIL，错误包含 `No module named 'agent_foundations.domain'`。
 
-- [ ] **Step 3: 实现不可变领域模型**
+- [x] **Step 3: 实现不可变领域模型**
 
 ```python
 # src/agent_foundations/domain/__init__.py
@@ -319,7 +319,7 @@ class ModelProvider(Protocol):
     async def complete(self, request: ModelRequest) -> ModelResponse: ...
 ```
 
-- [ ] **Step 4: 验证领域测试通过**
+- [x] **Step 4: 验证领域测试通过**
 
 Run: `conda run -n agent-foundations python -m pytest tests/unit/domain/test_models.py -v`
 
@@ -341,7 +341,7 @@ git commit -m "feat: define agent domain models"
 - Create: `src/agent_foundations/providers/fake.py`
 - Test: `tests/unit/providers/test_fake.py`
 
-- [ ] **Step 1: 写 FakeModel 队列与耗尽测试**
+- [x] **Step 1: 写 FakeModel 队列与耗尽测试**
 
 ```python
 # tests/unit/providers/test_fake.py
@@ -371,13 +371,13 @@ async def test_fake_model_fails_when_script_is_exhausted() -> None:
         await provider.complete(request)
 ```
 
-- [ ] **Step 2: 验证 FakeModel 尚不存在**
+- [x] **Step 2: 验证 FakeModel 尚不存在**
 
 Run: `conda run -n agent-foundations python -m pytest tests/unit/providers/test_fake.py -v`
 
 Expected: FAIL，错误包含 `No module named 'agent_foundations.providers'`。
 
-- [ ] **Step 3: 实现错误层与 FakeModel**
+- [x] **Step 3: 实现错误层与 FakeModel**
 
 ```python
 # src/agent_foundations/domain/errors.py
@@ -475,7 +475,7 @@ class FakeModelProvider:
         return self._responses.popleft()
 ```
 
-- [ ] **Step 4: 验证 FakeModel 测试通过**
+- [x] **Step 4: 验证 FakeModel 测试通过**
 
 Run: `conda run -n agent-foundations python -m pytest tests/unit/providers/test_fake.py -v`
 
@@ -495,7 +495,7 @@ git commit -m "feat: add provider protocol and fake model"
 - Create: `src/agent_foundations/tools/registry.py`
 - Test: `tests/unit/tools/test_registry.py`
 
-- [ ] **Step 1: 写注册、未知工具与参数校验测试**
+- [x] **Step 1: 写注册、未知工具与参数校验测试**
 
 ```python
 # tests/unit/tools/test_registry.py
@@ -543,13 +543,13 @@ async def test_registry_rejects_unknown_tool() -> None:
         await registry.execute("missing", {})
 ```
 
-- [ ] **Step 2: 验证 Registry 测试先失败**
+- [x] **Step 2: 验证 Registry 测试先失败**
 
 Run: `conda run -n agent-foundations python -m pytest tests/unit/tools/test_registry.py -v`
 
 Expected: FAIL，错误包含 `No module named 'agent_foundations.tools.registry'`。
 
-- [ ] **Step 3: 实现注册和执行边界**
+- [x] **Step 3: 实现注册和执行边界**
 
 ```python
 # src/agent_foundations/tools/__init__.py
@@ -601,7 +601,7 @@ class ToolRegistry:
         return await tool.execute(arguments)
 ```
 
-- [ ] **Step 4: 验证 Registry 测试通过**
+- [x] **Step 4: 验证 Registry 测试通过**
 
 Run: `conda run -n agent-foundations python -m pytest tests/unit/tools/test_registry.py -v`
 
@@ -622,7 +622,7 @@ git commit -m "feat: add validated tool registry"
 - Create: `src/agent_foundations/context/builder.py`
 - Test: `tests/unit/context/test_builder.py`
 
-- [ ] **Step 1: 写优先级与截断测试**
+- [x] **Step 1: 写优先级与截断测试**
 
 ```python
 # tests/unit/context/test_builder.py
@@ -654,13 +654,13 @@ def test_builder_does_not_mutate_source_messages() -> None:
     assert source.content == "123456"
 ```
 
-- [ ] **Step 2: 验证 Context 模块尚不存在**
+- [x] **Step 2: 验证 Context 模块尚不存在**
 
 Run: `conda run -n agent-foundations python -m pytest tests/unit/context/test_builder.py -v`
 
 Expected: FAIL，错误包含 `No module named 'agent_foundations.context'`。
 
-- [ ] **Step 3: 实现确定性预算算法**
+- [x] **Step 3: 实现确定性预算算法**
 
 ```python
 # src/agent_foundations/context/__init__.py
@@ -722,7 +722,7 @@ class ContextBuilder:
         return len(message.content or "")
 ```
 
-- [ ] **Step 4: 验证 Context 测试通过**
+- [x] **Step 4: 验证 Context 测试通过**
 
 Run: `conda run -n agent-foundations python -m pytest tests/unit/context/test_builder.py -v`
 
@@ -741,7 +741,7 @@ git commit -m "feat: add deterministic context budgeting"
 - Create: `tests/contract/test_protocols.py`
 - Create: `docs/learning-notes/01-foundations.md`
 
-- [ ] **Step 1: 写运行时协议契约测试**
+- [x] **Step 1: 写运行时协议契约测试**
 
 ```python
 # tests/contract/test_protocols.py
@@ -775,13 +775,13 @@ async def _type_check_provider(provider: ModelProvider, request: ModelRequest) -
     return await provider.complete(request)
 ```
 
-- [ ] **Step 2: 运行契约测试**
+- [x] **Step 2: 运行契约测试**
 
 Run: `conda run -n agent-foundations python -m pytest tests/contract/test_protocols.py -v`
 
 Expected: `2 passed`。
 
-- [ ] **Step 3: 写基础层学习笔记**
+- [x] **Step 3: 写基础层学习笔记**
 
 ```markdown
 # 01 Foundations 学习笔记
@@ -808,7 +808,7 @@ Expected: `2 passed`。
 - 哪些成熟抽象适合当前阶段，哪些属于过早设计？
 ```
 
-- [ ] **Step 4: 运行 Milestone 1 全量门禁**
+- [x] **Step 4: 运行 Milestone 1 全量门禁**
 
 Run: `conda run -n agent-foundations python -m pytest tests/unit tests/contract -q`
 
@@ -831,9 +831,9 @@ git commit -m "test: verify foundation protocols"
 
 ## Milestone 1 完成条件
 
-- [ ] 所有领域模型不可变且通过 Pydantic 校验。
-- [ ] FakeModel 能记录请求并按脚本返回结果。
-- [ ] ToolRegistry 能导出 Schema、拒绝未知工具并在执行前验证参数。
-- [ ] ContextBuilder 的选择与截断结果可重复。
-- [ ] 单元、契约、Ruff、mypy 全部通过。
-- [ ] 学习笔记完成，并记录与 smolagents、OpenAI Agents SDK 的只读对照结论。
+- [x] 所有领域模型不可变且通过 Pydantic 校验。
+- [x] FakeModel 能记录请求并按脚本返回结果。
+- [x] ToolRegistry 能导出 Schema、拒绝未知工具并在执行前验证参数。
+- [x] ContextBuilder 的选择与截断结果可重复。
+- [x] 单元、契约、Ruff、mypy 全部通过。
+- [x] 学习笔记完成，并记录与 smolagents、OpenAI Agents SDK 的只读对照结论。
