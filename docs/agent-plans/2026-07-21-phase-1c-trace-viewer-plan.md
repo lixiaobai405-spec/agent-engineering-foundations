@@ -42,7 +42,7 @@ README.md
 - Create: `src/agent_foundations/runtime/redaction.py`
 - Test: `tests/unit/runtime/test_redaction.py`
 
-- [ ] **Step 1: 写密钥、Header、绝对路径与嵌套对象测试**
+- [x] **Step 1: 写密钥、Header、绝对路径与嵌套对象测试**
 
 ```python
 # tests/unit/runtime/test_redaction.py
@@ -69,13 +69,13 @@ def test_redacts_sensitive_keys_values_and_project_root(tmp_path: Path) -> None:
     assert result["safe"] == "token is a source-code variable"
 ```
 
-- [ ] **Step 2: 验证 Redactor 尚不存在**
+- [x] **Step 2: 验证 Redactor 尚不存在**
 
 Run: `conda run -n agent-foundations python -m pytest tests/unit/runtime/test_redaction.py -v`
 
 Expected: FAIL，错误包含 `No module named ...runtime.redaction`。
 
-- [ ] **Step 3: 实现递归且不修改源对象的脱敏器**
+- [x] **Step 3: 实现递归且不修改源对象的脱敏器**
 
 ```python
 # src/agent_foundations/runtime/redaction.py
@@ -122,7 +122,7 @@ class Redactor:
         return self._openai_like_key.sub("[REDACTED]", result)
 ```
 
-- [ ] **Step 4: 验证脱敏测试通过**
+- [x] **Step 4: 验证脱敏测试通过**
 
 Run: `conda run -n agent-foundations python -m pytest tests/unit/runtime/test_redaction.py -v`
 
@@ -141,7 +141,7 @@ git commit -m "feat: redact sensitive trace data"
 - Create: `src/agent_foundations/runtime/sinks.py`
 - Test: `tests/unit/runtime/test_sinks.py`
 
-- [ ] **Step 1: 写逐行持久化、脱敏和组合顺序测试**
+- [x] **Step 1: 写逐行持久化、脱敏和组合顺序测试**
 
 ```python
 # tests/unit/runtime/test_sinks.py
@@ -182,13 +182,13 @@ async def test_composite_emits_to_every_sink_in_order() -> None:
     assert first.events == second.events == [event]
 ```
 
-- [ ] **Step 2: 验证 Sinks 尚不存在**
+- [x] **Step 2: 验证 Sinks 尚不存在**
 
 Run: `conda run -n agent-foundations python -m pytest tests/unit/runtime/test_sinks.py -v`
 
 Expected: FAIL，错误包含 `No module named ...runtime.sinks`。
 
-- [ ] **Step 3: 实现持久化与组合**
+- [x] **Step 3: 实现持久化与组合**
 
 ```python
 # src/agent_foundations/runtime/sinks.py
@@ -228,7 +228,7 @@ class CompositeEventSink:
             await sink.emit(event)
 ```
 
-- [ ] **Step 4: 验证 Sink 测试通过**
+- [x] **Step 4: 验证 Sink 测试通过**
 
 Run: `conda run -n agent-foundations python -m pytest tests/unit/runtime/test_sinks.py -v`
 
@@ -247,7 +247,7 @@ git commit -m "feat: persist trace events as JSONL"
 - Create: `src/agent_foundations/runtime/replay.py`
 - Test: `tests/unit/runtime/test_replay.py`
 
-- [ ] **Step 1: 写顺序加载与损坏行报告测试**
+- [x] **Step 1: 写顺序加载与损坏行报告测试**
 
 ```python
 # tests/unit/runtime/test_replay.py
@@ -280,13 +280,13 @@ def test_reports_corrupt_line_number(tmp_path: Path) -> None:
         load_trace(path)
 ```
 
-- [ ] **Step 2: 验证 Replay 模块尚不存在**
+- [x] **Step 2: 验证 Replay 模块尚不存在**
 
 Run: `conda run -n agent-foundations python -m pytest tests/unit/runtime/test_replay.py -v`
 
 Expected: FAIL，错误包含 `No module named ...runtime.replay`。
 
-- [ ] **Step 3: 实现验证式回放**
+- [x] **Step 3: 实现验证式回放**
 
 ```python
 # src/agent_foundations/runtime/replay.py
@@ -320,7 +320,7 @@ def list_sessions(trace_dir: Path) -> list[str]:
     return sorted(path.stem for path in trace_dir.glob("*.jsonl") if path.is_file())
 ```
 
-- [ ] **Step 4: 验证 Replay 测试通过**
+- [x] **Step 4: 验证 Replay 测试通过**
 
 Run: `conda run -n agent-foundations python -m pytest tests/unit/runtime/test_replay.py -v`
 
@@ -342,7 +342,7 @@ git commit -m "feat: load and validate trace history"
 - Modify: `src/agent_foundations/runtime/sinks.py`
 - Test: `tests/unit/viewer/test_stream.py`
 
-- [ ] **Step 1: 写多订阅者顺序与 Viewer 离线降级测试**
+- [x] **Step 1: 写多订阅者顺序与 Viewer 离线降级测试**
 
 ```python
 # tests/unit/viewer/test_stream.py
@@ -415,7 +415,7 @@ async def test_live_sink_redacts_before_transport(tmp_path: Path) -> None:
     assert received["payload"] == {"api_key": "[REDACTED]"}
 ```
 
-- [ ] **Step 2: 增加 Web 依赖并验证测试失败**
+- [x] **Step 2: 增加 Web 依赖并验证测试失败**
 
 在 `pyproject.toml` 的 `dependencies` 增加：
 
@@ -433,7 +433,7 @@ Run: `conda run -n agent-foundations python -m pytest tests/unit/viewer/test_str
 
 Expected: FAIL，错误包含 `No module named 'agent_foundations.viewer'`。
 
-- [ ] **Step 3: 实现 Broker 和 SSE 编码**
+- [x] **Step 3: 实现 Broker 和 SSE 编码**
 
 ```python
 # src/agent_foundations/viewer/__init__.py
@@ -472,7 +472,7 @@ def encode_sse(event: TraceEvent) -> str:
     return f"event: {event.event_type}\ndata: {event.model_dump_json()}\n\n"
 ```
 
-- [ ] **Step 4: 在 `runtime/sinks.py` 增加最佳努力 Live Sink**
+- [x] **Step 4: 在 `runtime/sinks.py` 增加最佳努力 Live Sink**
 
 在 imports 增加：
 
@@ -528,7 +528,7 @@ git commit -m "feat: stream live trace events"
 - Create: `src/agent_foundations/viewer/app.py`
 - Test: `tests/integration/test_viewer_api.py`
 
-- [ ] **Step 1: 写本机事件接收、历史列表和 SSE 响应测试**
+- [x] **Step 1: 写本机事件接收、历史列表和 SSE 响应测试**
 
 ```python
 # tests/integration/test_viewer_api.py
@@ -564,13 +564,13 @@ def test_rejects_session_path_traversal(tmp_path: Path) -> None:
         assert response.status_code in {404, 422}
 ```
 
-- [ ] **Step 2: 验证 Viewer App 尚不存在**
+- [x] **Step 2: 验证 Viewer App 尚不存在**
 
 Run: `conda run -n agent-foundations python -m pytest tests/integration/test_viewer_api.py -v`
 
 Expected: FAIL，错误包含 `No module named ...viewer.app`。
 
-- [ ] **Step 3: 实现只读 API、事件入口和 SSE**
+- [x] **Step 3: 实现只读 API、事件入口和 SSE**
 
 ```python
 # src/agent_foundations/viewer/app.py
@@ -635,11 +635,11 @@ def _valid_session_id(value: str) -> bool:
     return bool(value) and all(character.isalnum() or character in {"-", "_"} for character in value)
 ```
 
-- [ ] **Step 4: 验证 Viewer API 测试通过**
+- [x] **Step 4: 验证 Viewer API 测试通过**
 
 Run: `conda run -n agent-foundations python -m pytest tests/integration/test_viewer_api.py -v`
 
-Expected: `2 passed`。
+Expected: `4 passed`。
 
 - [ ] **Step 5: 提交 Viewer API**
 
@@ -659,7 +659,7 @@ git commit -m "feat: expose local trace viewer API"
 - Create: `src/agent_foundations/viewer/static/app.ts`
 - Generate: `src/agent_foundations/viewer/static/dist/app.js`
 
-- [ ] **Step 1: 创建 TypeScript 构建配置**
+- [x] **Step 1: 创建 TypeScript 构建配置**
 
 ```json
 {
@@ -702,7 +702,7 @@ Run: `npm install`
 
 Expected: 安装成功并生成 `package-lock.json`；执行前说明这是联网安装，用户确认后再运行。
 
-- [ ] **Step 2: 创建语义化页面结构**
+- [x] **Step 2: 创建语义化页面结构**
 
 ```html
 <!-- src/agent_foundations/viewer/static/index.html -->
@@ -752,7 +752,7 @@ Expected: 安装成功并生成 `package-lock.json`；执行前说明这是联�
 </html>
 ```
 
-- [ ] **Step 3: 创建克制的三栏调试界面样式**
+- [x] **Step 3: 创建克制的三栏调试界面样式**
 
 ```css
 /* src/agent_foundations/viewer/static/styles.css */
@@ -793,7 +793,7 @@ h2 { font-size: 14px; }
 @media (max-width: 640px) { .layout { display: block; } .topbar { padding: 0 14px; } .sidebar, .timeline-panel, .detail-panel { border-right: 0; border-bottom: 1px solid #252a32; } }
 ```
 
-- [ ] **Step 4: 实现历史加载、实时流、筛选和详情标签**
+- [x] **Step 4: 实现历史加载、实时流、筛选和详情标签**
 
 ```typescript
 // src/agent_foundations/viewer/static/app.ts
@@ -955,7 +955,7 @@ git commit -m "feat: build interactive trace viewer"
 - Modify: `src/agent_foundations/cli/main.py`
 - Modify: `tests/e2e/test_cli.py`
 
-- [ ] **Step 1: 扩展 CLI 测试，验证默认 JSONL 和固定本机绑定**
+- [x] **Step 1: 扩展 CLI 测试，验证默认 JSONL 和固定本机绑定**
 
 在 `tests/e2e/test_cli.py` 增加：
 
@@ -978,13 +978,13 @@ def test_viewer_command_binds_loopback(monkeypatch: MonkeyPatch, tmp_path: Path)
     monkeypatch.setattr(main, "build_runtime", lambda root, trace_dir, viewer_url: FakeLoop())
 ```
 
-- [ ] **Step 2: 运行测试确认 CLI 尚未支持 Viewer**
+- [x] **Step 2: 运行测试确认 CLI 尚未支持 Viewer**
 
 Run: `conda run -n agent-foundations python -m pytest tests/e2e/test_cli.py -v`
 
 Expected: FAIL，错误显示没有 `viewer` 命令或 `uvicorn` 属性。
 
-- [ ] **Step 3: 用以下完整版本替换 CLI 主模块**
+- [x] **Step 3: 用以下完整版本替换 CLI 主模块**
 
 ```python
 # src/agent_foundations/cli/main.py
@@ -1073,7 +1073,7 @@ if __name__ == "__main__":
     app()
 ```
 
-- [ ] **Step 4: 验证 CLI 测试和帮助文本**
+- [x] **Step 4: 验证 CLI 测试和帮助文本**
 
 Run: `conda run -n agent-foundations python -m pytest tests/e2e/test_cli.py -v`
 
@@ -1098,7 +1098,7 @@ git commit -m "feat: connect CLI tracing and viewer"
 - Modify: `README.md`
 - Create: `docs/learning-notes/03-observability.md`
 
-- [ ] **Step 1: 增加浏览器测试依赖**
+- [x] **Step 1: 增加浏览器测试依赖**
 
 在 `pyproject.toml` 的 `dev` dependencies 增加：
 
@@ -1114,7 +1114,7 @@ Run: `conda run -n agent-foundations python -m playwright install chromium`
 
 Expected: Chromium 安装成功；该命令联网并写入 Playwright 浏览器缓存，执行前说明影响并获得用户确认。
 
-- [ ] **Step 2: 写历史 Session 的浏览器端到端测试**
+- [x] **Step 2: 写历史 Session 的浏览器端到端测试**
 
 ```python
 # tests/e2e/test_trace_viewer.py
@@ -1163,7 +1163,7 @@ def test_viewer_loads_history_and_shows_event_detail(tmp_path: Path, page: Page)
         thread.join(timeout=10)
 ```
 
-- [ ] **Step 3: 编写可执行 README**
+- [x] **Step 3: 编写可执行 README**
 
 ```markdown
 # Agent Engineering Foundations
@@ -1221,7 +1221,7 @@ npm run typecheck:viewer
 自动测试不调用真实模型。真实 API Smoke Test 只在用户主动确认费用后执行。
 ```
 
-- [ ] **Step 4: 写可观察性学习笔记**
+- [x] **Step 4: 写可观察性学习笔记**
 
 ```markdown
 # 03 Observability 学习笔记

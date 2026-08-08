@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "rootDir": "src/agent_foundations/viewer/static",
+    "outDir": "src/agent_foundations/viewer/static/dist",
+    "skipLibCheck": true
+  },
+  "include": ["src/agent_foundations/viewer/static/app.ts"]
+}

@@ -1,0 +1,43 @@
+"""Chat control-plane domain models."""
+
+from agent_foundations.chat.models import (
+    AccessDecision,
+    AccessOperation,
+    AccessScope,
+    ApprovalRequest,
+    ApprovalStatus,
+    ChatEvent,
+    ChatEventType,
+    ChatMessage,
+    ChatModel,
+    Conversation,
+    MessageRole,
+    PermissionMode,
+    PolicyDecision,
+    ResourceKind,
+    RunRecord,
+    RunStatus,
+    new_id,
+    utc_now,
+)
+
+__all__ = [
+    "AccessDecision",
+    "AccessOperation",
+    "AccessScope",
+    "ApprovalRequest",
+    "ApprovalStatus",
+    "ChatEvent",
+    "ChatEventType",
+    "ChatMessage",
+    "ChatModel",
+    "Conversation",
+    "MessageRole",
+    "PermissionMode",
+    "PolicyDecision",
+    "ResourceKind",
+    "RunRecord",
+    "RunStatus",
+    "new_id",
+    "utc_now",
+]

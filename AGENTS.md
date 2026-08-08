@@ -21,13 +21,16 @@
 
 1. `docs/agent-plans/2026-07-20-agent-engineering-learning-design.md`
 2. `docs/agent-plans/2026-07-21-phase-1-implementation-plan.md`
-3. 当前被用户指定执行的里程碑计划
+3. `docs/agent-plans/2026-08-02-phase-1d-interactive-chat-ui-design.md`
+4. `docs/agent-plans/2026-08-02-phase-1d-interactive-chat-ui-plan.md`
+5. 当前被用户明确指定执行的 Task
 
 第一阶段计划：
 
 - Phase 1A：`docs/agent-plans/2026-07-21-phase-1a-foundations-plan.md`
 - Phase 1B：`docs/agent-plans/2026-07-21-phase-1b-readonly-agent-plan.md`
 - Phase 1C：`docs/agent-plans/2026-07-21-phase-1c-trace-viewer-plan.md`
+- Phase 1D：`docs/agent-plans/2026-08-02-phase-1d-interactive-chat-ui-plan.md`
 
 优先级：
 
@@ -41,27 +44,30 @@
 
 ## 3. 当前阶段边界
 
-除非用户明确切换阶段，否则只执行 Phase 1A。
+Phase 1A 已于 2026-07-25 通过用户验收，Phase 1B 与 Phase 1C 已于 2026-08-01 通过用户验收。
+当前阶段为 Phase 1D。每次会话只能执行用户当前明确指定的一个 Task；真实进度以 Phase 1D 计划中的已验证复选框和用户验收为准，不在本文件中固定某个 Task 为永久当前任务。
 
-Phase 1A 允许实现：
+Phase 1D 允许实现：
 
-- Python 项目骨架
-- `Message`、`ToolCall`、`ModelRequest`、`ModelResponse`
-- `ModelProvider` 协议与 `FakeModelProvider`
-- `Tool`、`ToolResult`、JSON Schema、`ToolRegistry`
-- `ContextBudget`、`ContextBuilder`
-- 单元测试、契约测试、Ruff、mypy
-- `docs/learning-notes/01-foundations.md`
+- Chat 领域模型、SQLite 持久化、FastAPI Chat API 与 SSE
+- React + TypeScript + Vite 本机 Chat UI（`127.0.0.1` 绑定）
+- `PROJECT_READ_ONLY` 与 `ASK_FOR_ACCESS` 两种只读权限模式
+- 项目外只读访问的一次性审批（exact path，非永久授权）
+- Chat 与现有 Trace Viewer / JSONL Trace 的关联与投影
+- 单元测试、集成测试、浏览器端到端测试
+- Ruff、mypy、TypeScript 构建与类型检查
+- `README.md` 与 `docs/learning-notes/04-chat-control-plane.md`
 
-Phase 1A 禁止提前实现：
+Phase 1D 禁止提前实现：
 
-- 真实 OpenAI-compatible Provider
-- 文件系统工具
-- Agent Loop、CLI、Trace、FastAPI、SSE、Web Viewer
-- 写文件、Shell、Git 工具
-- Planning、Memory、Skills、Hooks、MCP、Sandbox、Sub-Agent
+- 写文件、删除文件、Shell、Git、网络工具
+- 写操作、命令或网络访问的审批
+- 永久目录授权、“本次会话全部允许”或真正的 unrestricted full access
+- 远程绑定、登录或多租户部署
+- Planning、Checkpoint、Memory、Skills、Hooks、MCP、Sandbox、Sub-Agent
+- 未经用户当前任务明确确认的真实模型或付费 API Smoke Test
 
-只有 Phase 1A 完成条件全部满足并经用户确认后，才进入 Phase 1B。
+只有 Phase 1D 完成条件全部满足并经用户确认后，才进入第二阶段“可控 Coding Agent”。
 
 ## 4. 执行模型的角色
 
@@ -75,13 +81,24 @@ Phase 1A 禁止提前实现：
 
 用户应在每次新对话中明确指定一个角色。一段对话只承担一个角色；未指定时保持中立，不擅自假定为执行者。
 
-交给 Claude、DeepSeek 或其他模型执行 Phase 1A 时，建议使用：
+### 跨对话 Task evidence
+
+实现型 Task 默认使用 `docs/task-evidence/<task-id>.md` 保存跨对话证据，具体格式以 `docs/task-evidence/_template.md` 为准。`task-id` 应稳定且可从当前计划定位，例如 `phase-1d-task-5`。如果当前计划或 `task-spec.md` 已指定其他路径，以明确指定的路径为准。
+
+- `planner`：在计划或 `task-spec.md` 中明确 Task ID、evidence 路径、是否要求 TDD、Red/Green 命令和质量门禁；不把 executor 的运行结果写进 planner 拥有的规范文档。
+- `executor`：在修改生产代码前创建或更新 evidence，记录修改前状态；在命令实际运行时写入 Red、Green、退出码、关键原始输出、质量门禁和范围检查。最终回复只提供摘要和 evidence 链接。
+- `reviewer`：读取 evidence，但把它视为 executor 提交的材料而不是独立证明；必须检查当前代码和 diff，并亲自重跑足以支持结论的当前验证。
+- `context-guardian`：交接时说明当前 Task evidence 路径，以及 Red、Green 和 reviewer 独立验证是否存在。
+
+缺失的历史 Red 必须标记为 `unavailable`，不得凭记忆补写，也不得在实现完成后临时破坏代码并冒充原始 Red。reviewer 必须分别报告当前实现和 TDD 过程证据；新鲜复验只能证明当前行为，不能独立证明历史 Red→Green 顺序。既有 Task 不要求追溯生成虚假的 evidence。
+
+交给 Claude、DeepSeek 或其他模型执行 Phase 1D 时，建议使用：
 
 ```text
-你是 executor。先完整阅读项目根目录 AGENTS.md、已确认设计文档和 Phase 1A 计划。
-严格按 Phase 1A 的 Task 顺序执行，一次只处理一个 Task，不扩大范围。
+你是 executor。先完整阅读项目根目录 AGENTS.md、已确认设计文档和 Phase 1D 计划。
+严格按 Phase 1D 的 Task 顺序执行，一次只处理用户当前明确指定的一个 Task，不扩大范围。
 每个 Task 都要先展示失败测试证据，再实现最小代码，然后运行指定验证。
-未经我明确授权，不要 commit、push、创建 PR，也不要进入 Phase 1B。
+未经我明确授权，不要安装依赖、调用真实模型、commit、push、创建 PR，也不要进入第二阶段。
 ```
 
 ## 5. 标准执行流程
@@ -91,13 +108,15 @@ Phase 1A 禁止提前实现：
 1. 阅读该 Task 的目标、文件清单、测试和完成条件。
 2. 检查 `git status --short`，识别已有未提交改动。
 3. 说明本批修改范围、预期影响和回退方式。
-4. 写计划指定的失败测试。
-5. 运行最小测试并保存真实失败证据。
-6. 编写让该测试通过的最小实现。
-7. 运行该 Task 的目标测试。
-8. 运行受影响范围的 Ruff 和 mypy。
-9. 检查 `git diff`，确认没有无关改动、敏感信息或生成物。
-10. 向用户报告结果并等待下一 Task，除非用户已明确授权连续执行。
+4. 对实现型 Task，从模板创建或更新 Task evidence，记录修改前状态和用户已有改动。
+5. 写计划指定的失败测试。
+6. 运行最小测试，并立即把命令、退出码、关键原始输出和预期失败原因写入 evidence。
+7. 编写让该测试通过的最小实现。
+8. 运行该 Task 的目标测试，并记录 Green 结果。
+9. 运行受影响范围的 Ruff 和 mypy，并记录质量门禁。
+10. 检查 `git diff`，确认没有无关改动、敏感信息或生成物，并完成 evidence 范围审计。
+11. 记录未运行项、环境警告、证据缺口和推荐 reviewer 命令。
+12. 向用户报告摘要及 evidence 路径并等待下一 Task，除非用户已明确授权连续执行。
 
 不得：
 
@@ -141,6 +160,15 @@ Green：实现使该测试通过的最小代码
 Refactor：只在测试持续通过时进行必要整理
 ```
 
+TDD evidence 规则：
+
+- 只有在修改生产代码前实际运行并保存的失败，才能作为原始 Red 过程证据。
+- Red 必须因目标行为缺失而失败；语法错误、导入错误、环境错误或无关失败不算有效 Red。
+- 如果原始 Red 未保存，executor 必须在 evidence 中标记 `unavailable`，不得事后补造。
+- 文档、纯配置或其他不适用 TDD 的 Task，应记录 `not-applicable`、原因和替代验证。
+- evidence 不得包含真实 `.env` 值、密钥、Token、Cookie、密码、私钥或其他敏感载荷。
+- reviewer 可以评价提交的 TDD 证据是否完整、内部一致，但不得声称独立见证了历史过程。
+
 每个 Task 的最低验证：
 
 - 指定的 pytest 测试通过。
@@ -148,14 +176,22 @@ Refactor：只在测试持续通过时进行必要整理
 - 受影响模块通过 mypy strict。
 - `git diff --check` 无空白错误。
 
-Phase 1A 完成前必须运行：
+Phase 1D 完成前必须运行：
 
 ```powershell
-conda run -n agent-foundations python -m pytest tests/unit tests/contract -q
-conda run -n agent-foundations python -m ruff check src tests
+conda run -n agent-foundations python -m pytest -q
+conda run -n agent-foundations python -m ruff check .
 conda run -n agent-foundations python -m mypy src tests
+conda run -n agent-foundations python -m pip check
+npm run test:viewer
+npm run typecheck:viewer
+npm run test:chat
+npm run typecheck:chat
+npm run build:chat
 git diff --check
 ```
+
+其中 Chat 前端命令从 Phase 1D Task 10 安装并接入对应依赖后才可执行；在此之前不得为了运行尚不存在的脚本而提前安装依赖或扩大当前 Task。
 
 没有最新命令输出，不得声称“完成”“修复”或“全部通过”。
 
@@ -197,6 +233,12 @@ git diff --check
 Task：
 状态：完成 / 部分完成 / 阻塞
 
+Evidence：
+- 文件：
+- 当前验证状态：pass / partial / fail
+- TDD 过程证据：complete / incomplete / not-applicable
+- 未验证项或证据缺口：
+
 修改文件：
 - path：修改目的
 
@@ -225,7 +267,7 @@ Git 状态：
 - 下一 Task 或需要用户决定的问题
 ```
 
-不得只回复“已完成”或只提供代码摘要。
+不得只回复“已完成”或只提供代码摘要。完整过程证据写入 Task evidence；最终回复提供必要摘要和可定位的 evidence 路径，不重复粘贴整份文档。
 
 ## 13. 阻塞处理
 

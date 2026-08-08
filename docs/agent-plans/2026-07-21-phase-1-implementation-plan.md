@@ -41,6 +41,16 @@ Trace / JSONL / Redaction / Replay / FastAPI / SSE / Viewer
 | 2 | [Milestone 2: Read-only Agent](2026-07-21-phase-1b-readonly-agent-plan.md) | 第 3–4 周，约 40–48 小时 | CLI 可通过三个只读工具分析 fixture 项目，越权与敏感读取被拒绝 |
 | 3 | [Milestone 3: Trace Viewer](2026-07-21-phase-1c-trace-viewer-plan.md) | 第 5–6 周，约 40–48 小时 | 完整事件写入 JSONL、实时 SSE 展示、历史回放和浏览器验收 |
 
+### Phase 1D：进入 Phase 2 前的独立扩展
+
+Phase 1A–1C 构成原六周只读 Runtime 计划；Phase 1D 是用户于 2026-08-02 确认、在 Phase 2 之前插入的本机 Interactive Chat UI（交互式聊天界面）扩展：
+
+- 设计：[`2026-08-02-phase-1d-interactive-chat-ui-design.md`](2026-08-02-phase-1d-interactive-chat-ui-design.md)
+- 实施：[`2026-08-02-phase-1d-interactive-chat-ui-plan.md`](2026-08-02-phase-1d-interactive-chat-ui-plan.md)
+- 当前 Task 12 实现与 fresh 质量门禁已完成；**Phase 1D implementation completed, awaiting independent review/user acceptance**（evidence: `docs/task-evidence/phase-1d-task-12.md`）。
+- Phase 1D 仍只提供 Chat 控制面、SQLite 多轮状态、SSE 活动摘要和一次性项目外精确只读审批。
+- MCP、Memory、Sub-Agent、Shell、Sandbox、写文件和 Token streaming 继续留在 Phase 2–5；**Phase 2 未开始**。
+
 ## 3. 每周节奏
 
 ### 第 1 周：领域协议与 Provider
@@ -114,17 +124,17 @@ conda run -n agent-foundations python -m mypy src tests
 - [ ] `pytest`、Ruff、mypy 和 Viewer TypeScript 构建全部通过。
 - [ ] `README.md` 与三篇学习笔记能够解释模块职责、边界和取舍。
 
-## 6. 明确不在本阶段实现
+## 6. 原 Phase 1A–1C 明确不实现
 
 - 文件创建、编辑、删除与 Unified Diff
 - Shell、Git、测试执行与命令审批
 - Docker Sandbox（沙箱）
 - Planning、Checkpoint、Memory、Skills、Hooks、MCP
 - Sub-Agent 与多 Agent 编排
-- 面向最终用户的聊天 Web UI
+- 面向最终用户的聊天 Web UI（已由独立 Phase 1D 计划承接，不回填到 1A–1C）
 - Token 成本图、多 Agent 关系图与远程 Viewer
 
-完成上述验收后，再进入第二阶段“可控 Coding Agent”，避免提前扩大权限面和复杂度。
+完成上述验收后，还必须完成独立 Phase 1D 的既定 Task 9–12 与总验收，才能进入第二阶段“可控 Coding Agent”，避免提前扩大权限面和复杂度。
 
 ## 7. 实施时使用的官方基线
 

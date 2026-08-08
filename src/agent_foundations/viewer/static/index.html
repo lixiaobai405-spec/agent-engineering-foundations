@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Trace Viewer</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">AGENT ENGINEERING LAB</p>
+      <h1>Trace Viewer</h1>
+    </div>
+    <div class="status" role="status" aria-live="polite">
+      <span id="live-dot" aria-hidden="true"></span>
+      <span id="connection">Connecting…</span>
+    </div>
+  </header>
+  <main class="layout">
+    <aside class="sidebar">
+      <div class="navigation-heading">
+        <span>Trace sessions</span>
+        <button id="live-events" type="button" class="active">Live events</button>
+      </div>
+      <nav id="trace-navigation" aria-label="Trace sessions">
+        <p class="navigation-empty">Loading trace sessions…</p>
+      </nav>
+      <label for="event-filter">Event type</label>
+      <select id="event-filter"><option value="*">All events</option></select>
+      <label class="checkbox"><input id="auto-scroll" type="checkbox" checked> Auto scroll</label>
+      <p id="session-summary" role="status" aria-live="polite">No session selected</p>
+      <button id="copy-session-id" type="button" disabled>Copy full session ID</button>
+    </aside>
+    <section class="timeline-panel">
+      <div class="panel-title"><h2>Timeline</h2><span id="event-count">0 events</span></div>
+      <ol id="timeline" aria-live="polite"></ol>
+    </section>
+    <section class="detail-panel">
+      <div class="panel-title">
+        <h2>Event detail</h2>
+        <button id="copy-json" type="button" disabled>Copy JSON</button>
+      </div>
+      <nav id="tabs" aria-label="Event details"></nav>
+      <pre id="detail">Select an event from the timeline.</pre>
+    </section>
+  </main>
+  <script type="module" src="/static/dist/app.js"></script>
+</body>
+</html>

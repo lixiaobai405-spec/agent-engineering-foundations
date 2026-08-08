@@ -1,8 +1,9 @@
-from collections.abc import Iterable
-from typing import Any
+from collections.abc import Iterable, Mapping
+from typing import Any, cast
 
 from jsonschema import ValidationError, validate
 
+from agent_foundations.domain._freeze import to_json_value
 from agent_foundations.domain.errors import InvalidToolArgumentsError, UnknownToolError
 from agent_foundations.domain.tool import Tool, ToolDefinition, ToolResult
 
@@ -25,17 +26,26 @@ class ToolRegistry:
             for tool in self._tools.values()
         )
 
-    def validate_call(self, name: str, arguments: dict[str, Any]) -> Tool:
+    def validate_call(
+        self,
+        name: str,
+        arguments: Mapping[str, Any],
+    ) -> tuple[Tool, dict[str, Any]]:
         tool = self._tools.get(name)
         if tool is None:
             available = ", ".join(sorted(self._tools))
             raise UnknownToolError(f"unknown tool '{name}'; available tools: {available}")
+        normalized = cast(dict[str, Any], to_json_value(arguments))
         try:
-            validate(instance=arguments, schema=tool.input_schema())
+            validate(instance=normalized, schema=tool.input_schema())
         except ValidationError as exc:
             raise InvalidToolArgumentsError(exc.message) from exc
-        return tool
+        return tool, normalized
 
-    async def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
-        tool = self.validate_call(name, arguments)
-        return await tool.execute(arguments)
+    async def execute(
+        self,
+        name: str,
+        arguments: Mapping[str, Any],
+    ) -> ToolResult:
+        tool, normalized = self.validate_call(name, arguments)
+        return await tool.execute(normalized)

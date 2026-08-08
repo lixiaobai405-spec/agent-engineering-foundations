@@ -113,3 +113,15 @@ def _serialize_frozen(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_serialize_frozen(v) for v in value]
     return value
+
+
+def to_json_value(value: Any) -> Any:
+    """Return plain dict/list containers suitable for SDKs and JSON Schema.
+
+    FrozenJSON → dict, tuple → list.  Leaf values pass through unchanged.
+    """
+    if isinstance(value, Mapping):
+        return {key: to_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_json_value(item) for item in value]
+    return value
