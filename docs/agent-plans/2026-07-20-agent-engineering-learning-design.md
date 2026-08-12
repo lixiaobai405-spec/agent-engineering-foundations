@@ -392,7 +392,7 @@ HTTP、SQLite、Checkpoint 和 side-effect ledger 保存可恢复事实；SSE �
 - [ ] 第 5 周：实现 TraceEvent、EventSink、JSONL、脱敏和回放。
 - [ ] 第 6 周：实现 FastAPI、SSE 和本地 Web Trace Viewer，完成第一阶段验收。
 
-Phase 1D 作为进入 Phase 2 前的独立验收增量，继续执行已确认的 12 个顺序 Task。Task 12 实现（恢复 API、E2E、文档）已完成 fresh 门禁，**awaiting independent review/user acceptance**；不提前加入 MCP、Memory、Sub-Agent、Shell、Sandbox 或 Token streaming。Phase 2 未开始。
+Phase 1D 作为进入 Phase 2 前的独立验收增量，保持已确认的范围和 12 个顺序 Task 不变。Task 12 实现（恢复 API、E2E、文档）已完成 fresh 门禁，用户于 2026-08-08 确认第一阶段通过人工验收；Phase 1D 没有提前加入 MCP、Memory、Sub-Agent、Shell、Sandbox 或 Token streaming。Phase 2 设计与详细实施计划已生成，尚未授权或开始任何实现 Task。
 
 第一阶段完成标准：
 
@@ -408,12 +408,14 @@ Phase 1D 作为进入 Phase 2 前的独立验收增量，继续执行已确认�
 
 ### 阶段二：可控 Coding Agent，第 7–10 周
 
-- [ ] 第 7 周：建立离线 Agent Eval 运行器和固定任务集，保存 Phase 1 基线；同时增加 Planning、Todo 和重规划限制。
-- [ ] 第 8 周：把 Checkpoint 扩展为 Durable Execution，完成 schema/version、resume/retry/cancel、幂等键、副作用记录、崩溃点测试和单 run 所有权/lease；在该边界稳定后生成 Unified Diff。
-- [ ] 第 9 周：实现 Approval、Policy、Capability 与 Sandbox 的分层；增加修改前审批、拒绝、回滚记录和最小 Docker Sandbox，再开放受控文件写入。
-- [ ] 第 10 周：增加命令分类、只读 Shell 白名单、危险命令审批、Git 和测试反馈；合并 Repo Map、相关性评分、Context Budget、压缩、缓存、重试和限流，并跑离线 Eval 回归。
+权威设计：[`2026-08-08-phase-2-controllable-coding-agent-design.md`](2026-08-08-phase-2-controllable-coding-agent-design.md)。详细实施计划：[`2026-08-08-phase-2-controllable-coding-agent-plan.md`](2026-08-08-phase-2-controllable-coding-agent-plan.md)。Phase 2 保持四周总长度，拆成四个必须顺序验收的子里程碑；前一个子里程碑未验收时，不扩大下一层 Tool 或权限。
 
-阶段完成标准：Agent 能分析、计划、生成 Diff、经批准修改文件并运行测试；离线 Eval 可比较能力变化；进程崩溃后可从版本化状态恢复且不会重复已提交副作用；单个 run 同时只有一个有效 owner；Approval、Policy、Capability 与 Sandbox 的职责和执行顺序有自动测试；所有危险动作可见、可拒绝、可追踪。
+- [ ] Phase 2A / 第 7 周：建立离线 Agent Eval 运行器和固定任务集，保存 Phase 1 基线；增加 Planning、Todo 和重规划限制。这些属于 Runtime 控制能力，不新增有外部副作用的 Tool。
+- [ ] Phase 2B / 第 8 周：把 Checkpoint 扩展为 Durable Execution，完成 schema/version、resume/retry/cancel、幂等键、副作用记录、崩溃点测试和单 run 所有权/lease；边界稳定后增加 Unified Diff / Patch 生成、校验和预览能力，但不得写入文件。
+- [ ] Phase 2C / 第 9 周：实现 Approval、Policy、Capability 与 Sandbox 分层；保留 `PROJECT_READ_ONLY`，新增版本化 Permission Profile（`ASK_ALWAYS`、`RISK_BASED`、`PROJECT_FULL_ACCESS`、`CUSTOM`），并把 legacy `ASK_FOR_ACCESS` 迁移为新配置；完成修改前审批、拒绝、回滚记录和最小 Docker Sandbox 后，只开放项目内受控 `apply_patch`。`PermissionProfile` 与 `ExecutionBackend` 分离，`TrustedHostExecutor` 仅作为未来扩展点，不在本阶段实现。
+- [ ] Phase 2D / 第 10 周：增加命令分类和 Sandbox 内受限 `run_command`，首批只运行项目既定测试、lint、typecheck 和 build；增加只读 `git_status`、`git_diff`、`git_log`，默认硬拒绝包安装、网络、项目外写入和 Git 写操作；合并 Repo Map、相关性评分、Context Budget、压缩、缓存、重试和限流，并跑离线 Eval 回归。
+
+阶段完成标准：Agent 能分析、计划、生成 Diff、经批准修改项目文件、运行受限项目命令并读取 Git 反馈；离线 Eval 可比较能力变化；进程崩溃后可从版本化状态恢复且不会重复已提交副作用；单个 run 同时只有一个有效 owner；Approval、Policy、Capability、Permission Profile、Execution Backend 与 Sandbox 的职责和执行顺序有自动测试；权限配置固定能力清单和版本，新增 Tool 或恢复旧 run 不会静默扩大授权；所有危险动作可见、可拒绝、可追踪。Phase 2 的“完全访问”只表示项目范围内已实现能力，不表示任意终端、互联网或电脑文件访问。
 
 ### 阶段三：基线比较与 Fork Qwen Code，第 11–14 周
 
@@ -428,7 +430,7 @@ Fork 后不优先修改主题、Logo 或其他表层内容。
 
 - [ ] Runtime 组只读对照 OpenAI Agents SDK、Pydantic AI 和 LangGraph，重点研究 Agent Loop、HITL、Eval、Durable Execution 与类型/状态边界。
 - [ ] 多 Agent 组只读对照 Google ADK 2.0、Microsoft Agent Framework 和 DeerFlow 2.0，重点研究 Workflow/Task、Checkpoint、Sub-Agent 隔离和 OpenTelemetry。
-- [ ] Coding Harness 组只读对照 OpenHands、goose、mini-SWE-agent、OpenCode、OpenAI Codex 和 Grok Build；Browser Use 单独研究浏览器运行边界；Letta Agent/Letta Code 作为 Memory 与状态化 Coding Agent 对照。
+- [ ] Coding Harness 组只读对照 OpenHands、goose、mini-SWE-agent、OpenCode、OpenAI Codex 和 Grok Build；Browser Use 单独研究浏览器运行边界；Letta Agent/Letta Code 作为 Memory 与状态化 Coding Agent 对照。额外形成电脑级完全访问的威胁模型，比较可信主机执行、Shell/子进程、项目外文件、网络、凭据、紧急停止和 Trace 脱敏，但本阶段不实现。
 - [ ] 输出按主题而非按项目堆叠的架构比较文档，明确哪些设计进入自研 Runtime、哪些通过 Adapter 接入、哪些只保留为参考。
 
 ### 阶段五：通用多 Agent 平台，第 16–20 周
@@ -436,7 +438,7 @@ Fork 后不优先修改主题、Logo 或其他表层内容。
 - [ ] 第 16 周：实现内部 AgentDefinition、AgentTask、父子 Agent、任务委派、独立 Context、结构化结果回传和并发限制；子 Agent 的 Capability 必须从父 Agent 衰减，不能扩大权限。
 - [ ] 第 17 周：实现 Working、Session、Project Memory 和记忆生命周期，对照 Letta Agent/Letta Code；Memory 不作为权限或恢复事实源。
 - [ ] 第 18 周：实现 Skill Manifest、Skill Loader、Hooks、MCP Client Adapter、ACP Backend Adapter 和权限声明；在内部 AgentTask 稳定后增加最小 A2A Adapter。
-- [ ] 第 19 周：强化 Docker Sandbox、资源限制、网络策略、挂载白名单和清理机制；验证多 Agent run ownership、租约接管和副作用幂等。
+- [ ] 第 19 周：强化 Docker Sandbox、资源限制、网络策略、挂载白名单和清理机制；验证多 Agent run ownership、租约接管和副作用幂等。通过独立安全设计与用户确认门后，再实现默认关闭、仅本机启动时显式开启的 `TrustedHostExecutor` 与 `HOST_FULL_ACCESS`；Checkpoint 不自动恢复该授权，Agent 和 Sub-Agent 均不能自行开启或扩大它，远程及多租户环境禁止使用。
 - [ ] 第 20 周：将 Trace Viewer 升级为 Multi-Agent Studio，扩展 SSE/UI Event 展示任务树、并行时间线、Context、Token、成本和人工干预点，并增加 Trace 到 OpenTelemetry 的导出 Adapter。
 
 ### 更新后的参考项目矩阵
@@ -488,6 +490,7 @@ Fork 后不优先修改主题、Logo 或其他表层内容。
 - 清晰分层的 Approval、Policy、Capability 与 Sandbox。
 - 经审批的文件修改、Shell、Git 和测试能力。
 - Docker Sandbox。
+- 项目级权限配置与可选的可信主机完全访问后端；后者默认关闭且必须通过独立安全门。
 - Sub-Agent 与多 Agent 任务编排。
 - Qwen Code 的实质性个性化 Fork。
 - MCP、ACP、A2A、SSE/UI Event 和 Trace/OpenTelemetry 的 Adapter 与职责边界。

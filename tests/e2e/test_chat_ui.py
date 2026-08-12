@@ -32,11 +32,8 @@ from agent_foundations.runtime.loop import AgentLoop
 from agent_foundations.runtime.redaction import Redactor
 from agent_foundations.runtime.tool_execution import ToolCallExecutor
 from agent_foundations.runtime.trace import EventSink
-from agent_foundations.tools.filesystem.list_directory import ListDirectoryTool
-from agent_foundations.tools.filesystem.path_policy import PathPolicy
-from agent_foundations.tools.filesystem.read_file import ReadFileTool
-from agent_foundations.tools.registry import ToolRegistry
 from agent_foundations.viewer.app import CHAT_BUILD_DIR, create_app
+from tests.unit.tools.registry_helpers import readonly_tool_registry
 
 SAMPLE_PROJECT = Path(__file__).resolve().parents[1] / "fixtures" / "sample_project"
 
@@ -88,6 +85,24 @@ class GatedFakeModelProvider(FakeModelProvider):
         return self._responses.popleft()
 
 
+class SecondRequestGatedFakeModelProvider(FakeModelProvider):
+    def __init__(
+        self,
+        responses: list[ModelResponse],
+        release: asyncio.Event,
+    ) -> None:
+        super().__init__(responses)
+        self._release = release
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        self.requests.append(request)
+        if len(self.requests) == 2:
+            await self._release.wait()
+        if not self._responses:
+            raise FakeModelExhaustedError("fake model response script is exhausted")
+        return self._responses.popleft()
+
+
 def _run_async(coro: Any) -> Any:
     with ThreadPoolExecutor(max_workers=1) as executor:
         return executor.submit(asyncio.run, coro).result()
@@ -109,12 +124,9 @@ def _build_chat_app(
         event_sink: EventSink,
         tool_executor: ToolCallExecutor,
     ) -> AgentLoop:
-        policy = PathPolicy(Path(conversation.project_root))
         return AgentLoop(
             provider=provider,
-            registry=ToolRegistry(
-                [ListDirectoryTool(policy), ReadFileTool(policy)],
-            ),
+            registry=readonly_tool_registry(Path(conversation.project_root)),
             context_builder=ContextBuilder(ContextBudget()),
             event_sink=event_sink,
             config=AgentConfig(max_steps=8),
@@ -222,21 +234,40 @@ def browser_page(require_chat_build: None) -> Iterator[Page]:
 def test_chat_multi_turn_reload_trace_and_narrow_viewport(
     tmp_path: Path,
     browser_page: Page,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    provider = FakeModelProvider(
+    fake_credential = "FAKE_PROVIDER_" + "CREDENTIAL_9F31"
+    monkeypatch.setenv("OPENAI_API_KEY", fake_credential)
+    release = asyncio.Event()
+    provider = SecondRequestGatedFakeModelProvider(
         [
             ModelResponse(
                 tool_calls=(
                     ToolCall(id="turn1-tool", name="list_directory", arguments={"path": "."}),
                 ),
             ),
-            ModelResponse(content="Turn one answer"),
+            ModelResponse(
+                content=(
+                    "# Turn one answer\n\n"
+                    "- structured item\n\n"
+                    "| file | result |\n| - | - |\n| README.md | found |\n\n"
+                    "Use `read_file`.\n\n"
+                    "```python\nprint(\"hello\")\n```"
+                ),
+            ),
             ModelResponse(content="Turn two answer"),
         ],
+        release,
     )
     app, _repository, _broker = _build_chat_app(tmp_path, provider)
     server, thread, port = _start_server(app)
     try:
+        browser_page.add_init_script(
+            "window.__copiedCode = ''; "
+            "Object.defineProperty(navigator, 'clipboard', {value: {"
+            "writeText: async (text) => { window.__copiedCode = text; }"
+            "}});",
+        )
         browser_page.goto(f"http://127.0.0.1:{port}/chat")
         _create_conversation_ui(
             browser_page,
@@ -245,9 +276,32 @@ def test_chat_multi_turn_reload_trace_and_narrow_viewport(
             permission_mode="PROJECT_READ_ONLY",
         )
         _send_message(browser_page, "Summarize the sample project")
-        expect(browser_page.get_by_text("Turn one answer")).to_be_visible(timeout=15_000)
+        activity_toggle = browser_page.get_by_role(
+            "button",
+            name=re.compile(r"1 tool activity", re.IGNORECASE),
+        )
+        expect(activity_toggle).to_be_visible(timeout=15_000)
+        expect(activity_toggle).to_have_attribute("aria-expanded", "true")
+        expect(browser_page.get_by_text("list_directory")).to_be_visible()
+        activity_toggle.click()
+        expect(activity_toggle).to_have_attribute("aria-expanded", "false")
+
+        release.set()
+        expect(browser_page.get_by_role("heading", name="Turn one answer")).to_be_visible(
+            timeout=15_000,
+        )
+        expect(browser_page.locator(".message-markdown ul")).to_contain_text(
+            "structured item",
+        )
+        expect(browser_page.get_by_role("table")).to_be_visible()
+        expect(browser_page.get_by_text("read_file", exact=True)).to_be_visible()
+        expect(browser_page.get_by_text("python", exact=True)).to_be_visible()
+        browser_page.get_by_role("button", name="Copy code").click()
+        assert browser_page.evaluate("window.__copiedCode") == 'print("hello")\n'
+        expect(activity_toggle).to_have_attribute("aria-expanded", "false")
         expect(browser_page.get_by_text("Tool requested")).to_have_count(0)
-        expect(browser_page.get_by_text("Run completed")).to_have_count(0)
+        expect(browser_page.locator(".activity-card")).to_have_count(0)
+        expect(browser_page.get_by_text("tool.call.completed", exact=True)).to_have_count(0)
 
         trace_link = browser_page.get_by_role(
             "link",
@@ -286,11 +340,18 @@ def test_chat_multi_turn_reload_trace_and_narrow_viewport(
         expect(browser_page.get_by_text("Summarize the sample project")).to_be_visible(
             timeout=15_000,
         )
-        expect(browser_page.get_by_text("Turn one answer")).to_be_visible(timeout=15_000)
+        expect(browser_page.get_by_role("heading", name="Turn one answer")).to_be_visible(
+            timeout=15_000,
+        )
         expect(browser_page.get_by_text("Turn two answer")).to_be_visible(timeout=15_000)
         expect(
             browser_page.get_by_role("link", name="Open trace for this turn"),
         ).to_have_count(2)
+        reloaded_activity_toggle = browser_page.get_by_role(
+            "button",
+            name=re.compile(r"1 tool activity", re.IGNORECASE),
+        )
+        expect(reloaded_activity_toggle).to_have_attribute("aria-expanded", "false")
 
         browser_page.set_viewport_size({"width": 390, "height": 844})
         browser_page.goto(f"http://127.0.0.1:{port}/chat")
@@ -331,6 +392,26 @@ def test_chat_multi_turn_reload_trace_and_narrow_viewport(
         assert timeline_overflow == "visible"
         _assert_locator_in_viewport(browser_page, message_input)
         _assert_locator_in_viewport(browser_page, send_button)
+
+        conversations_response = browser_page.request.get(
+            f"http://127.0.0.1:{port}/api/chat/conversations",
+        )
+        assert fake_credential not in conversations_response.text()
+        conversations = _run_async(_repository.list_conversations())
+        conversation_id_for_scan = conversations[0].conversation_id
+        for suffix in ("messages", "runs", "activities", "state"):
+            response = browser_page.request.get(
+                f"http://127.0.0.1:{port}/api/chat/conversations/"
+                f"{conversation_id_for_scan}/{suffix}",
+            )
+            assert fake_credential not in response.text()
+        assert fake_credential not in browser_page.locator("body").inner_text()
+        assert fake_credential.encode() not in (tmp_path / "state" / "chat.sqlite3").read_bytes()
+        for trace_file in (tmp_path / "traces").glob("*.jsonl"):
+            assert fake_credential.encode() not in trace_file.read_bytes()
+        for asset in CHAT_BUILD_DIR.rglob("*"):
+            if asset.is_file():
+                assert fake_credential.encode() not in asset.read_bytes()
     finally:
         _stop_server(server, thread)
 
@@ -420,8 +501,12 @@ def test_chat_ask_access_approve_once_repeat_and_deny(
             permission_mode="ASK_FOR_ACCESS",
         )
         _send_message(browser_page, "Read the external fixture")
-        expect(browser_page.get_by_role("article", name="Approval request")).to_be_visible(
-            timeout=15_000,
+        first_card = browser_page.get_by_role("article", name="Approval request")
+        expect(first_card).to_be_visible(timeout=15_000)
+        first_activity_row = first_card.locator("xpath=ancestor::li[1]")
+        expect(first_activity_row).to_contain_text("read_file")
+        expect(first_card.locator("xpath=ancestor::section[1]")).to_have_class(
+            re.compile(r"tool-activity-group"),
         )
         browser_page.get_by_role("button", name="Approve once", disabled=False).click()
         expect(browser_page.get_by_text("Approved once answer")).to_be_visible(
@@ -651,6 +736,11 @@ def test_chat_service_restart_invalidates_waiting_approval(
         assert latest_run is not None
         assert latest_run.status.value == "interrupted"
         assert pending is None
+        interrupted_activities = _run_async(
+            repository2.list_tool_activities(conversation_id),
+        )
+        assert len(interrupted_activities) == 1
+        assert interrupted_activities[0].status.value == "interrupted"
         browser_page.goto(f"http://127.0.0.1:{port2}/chat")
         expect(
             browser_page.get_by_role("button", name=re.compile(r"Restart semantics")),

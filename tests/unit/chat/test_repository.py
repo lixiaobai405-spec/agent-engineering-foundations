@@ -1,27 +1,30 @@
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
 import pytest
 
-import agent_foundations.chat.repository as repository_module
+import agent_foundations.chat.schema as chat_schema_module
 from agent_foundations.chat.errors import ChatConflictError, ChatNotFoundError
 from agent_foundations.chat.models import (
     AccessOperation,
     ApprovalStatus,
+    ChatToolActivity,
     MessageRole,
     PermissionMode,
     RunRecord,
     RunStatus,
+    ToolActivityStatus,
 )
 from agent_foundations.chat.repository import (
     ConversationRepository,
     UnsupportedSchemaVersionError,
 )
+from agent_foundations.storage.migrations import Migration
 
 CONVERSATION_ID_A = "11111111-1111-4111-8111-111111111111"
 CONVERSATION_ID_B = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -41,6 +44,8 @@ APPROVAL_ID_D = "d0000000-0000-4000-8000-0000000000d4"
 TRACE_PATH = "traces/session.jsonl"
 NOW = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
 NOW_TEXT = NOW.isoformat()
+ACTIVITY_EVENT_ID = "12345678-1234-4234-8234-123456789001"
+ACTIVITY_EVENT_ID_B = "12345678-1234-4234-8234-123456789002"
 
 
 class _InterceptingConnection:
@@ -66,6 +71,32 @@ async def _open_repository(path: Path) -> ConversationRepository:
     repository = ConversationRepository(path)
     await repository.initialize()
     return repository
+
+
+def _activity(
+    *,
+    conversation_id: str,
+    session_id: str,
+    status: ToolActivityStatus,
+    tool_call_id: str = "call-1",
+    arguments_summary: str | None = "README.md",
+    result_summary: str | None = None,
+    started_at: datetime = NOW,
+    finished_at: datetime | None = None,
+    last_event_id: str = ACTIVITY_EVENT_ID,
+) -> ChatToolActivity:
+    return ChatToolActivity(
+        conversation_id=conversation_id,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+        tool_name="read_file",
+        status=status,
+        arguments_summary=arguments_summary,
+        result_summary=result_summary,
+        started_at=started_at,
+        finished_at=finished_at,
+        last_event_id=last_event_id,
+    )
 
 
 def _insert_message(
@@ -300,7 +331,7 @@ async def test_schema_enables_foreign_keys_and_version(tmp_path: Path) -> None:
     repository = ConversationRepository(path)
     await repository.initialize()
     with repository._connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 
@@ -320,8 +351,244 @@ async def test_schema_contains_required_tables_and_index(tmp_path: Path) -> None
                 "SELECT name FROM sqlite_master WHERE type = 'index'",
             )
         }
-    assert tables >= {"conversations", "messages", "runs", "approval_requests"}
+    assert tables >= {
+        "conversations",
+        "messages",
+        "runs",
+        "approval_requests",
+        "chat_tool_activities",
+    }
     assert "one_active_run_per_conversation" in indexes
+    assert "idx_chat_tool_activities_session_started" in indexes
+
+
+@pytest.mark.asyncio
+async def test_initialize_migrates_v1_database_to_v2_without_rewriting_data(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "chat.sqlite3"
+    repository = await _open_repository(path)
+    created = await repository.create_conversation(
+        title="Existing conversation",
+        project_root=tmp_path,
+        permission_mode=PermissionMode.PROJECT_READ_ONLY,
+    )
+    with repository._connect() as connection:
+        _insert_message(
+            connection,
+            message_id=MESSAGE_ID,
+            conversation_id=created.conversation_id,
+        )
+        _insert_run(
+            connection,
+            session_id=SESSION_ID,
+            conversation_id=created.conversation_id,
+            user_message_id=MESSAGE_ID,
+            status=RunStatus.COMPLETED.value,
+        )
+        _insert_pending_approval(
+            connection,
+            approval_id=APPROVAL_ID,
+            conversation_id=created.conversation_id,
+            session_id=SESSION_ID,
+        )
+        preservation_queries = {
+            "conversations": "SELECT * FROM conversations ORDER BY rowid",
+            "messages": "SELECT * FROM messages ORDER BY rowid",
+            "runs": "SELECT * FROM runs ORDER BY rowid",
+            "approval_requests": "SELECT * FROM approval_requests ORDER BY rowid",
+        }
+        preserved_before = {
+            table: [tuple(row) for row in connection.execute(query)]
+            for table, query in preservation_queries.items()
+        }
+        connection.execute("DROP TABLE IF EXISTS capabilities")
+        connection.execute("DROP TABLE IF EXISTS authorization_requests")
+        connection.execute("DROP INDEX IF EXISTS idx_chat_tool_activities_session_started")
+        connection.execute("DROP TABLE IF EXISTS chat_tool_activities")
+        connection.execute("DROP TABLE IF EXISTS patch_proposals")
+        connection.execute("DROP TABLE IF EXISTS side_effects")
+        connection.execute("DROP TABLE IF EXISTS run_leases")
+        connection.execute("DROP TABLE IF EXISTS run_checkpoints")
+        connection.execute("DROP TABLE IF EXISTS durable_runs")
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+
+    migrated = ConversationRepository(path)
+    await migrated.initialize()
+
+    with migrated._connect() as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'",
+            )
+        }
+        preserved_after = {
+            table: [tuple(row) for row in connection.execute(query)]
+            for table, query in preservation_queries.items()
+        }
+    assert version == 7
+    assert "chat_tool_activities" in tables
+    assert "durable_runs" in tables
+    assert "run_leases" in tables
+    assert "side_effects" in tables
+    assert "patch_proposals" in tables
+    assert await migrated.get_conversation(created.conversation_id) == created
+    assert preserved_after == preserved_before
+
+
+@pytest.mark.asyncio
+async def test_upsert_tool_activity_merges_by_session_and_call_id(
+    tmp_path: Path,
+) -> None:
+    repository = await _open_repository(tmp_path / "chat.sqlite3")
+    conversation_id = await _create_conversation(repository, tmp_path)
+    _, run = await repository.begin_run(
+        conversation_id,
+        content="inspect README",
+        session_id=SESSION_ID,
+    )
+    requested = _activity(
+        conversation_id=conversation_id,
+        session_id=run.session_id,
+        status=ToolActivityStatus.RUNNING,
+    )
+    completed = requested.model_copy(
+        update={
+            "status": ToolActivityStatus.COMPLETED,
+            "arguments_summary": None,
+            "result_summary": "12 lines",
+            "finished_at": NOW + timedelta(seconds=1),
+            "last_event_id": ACTIVITY_EVENT_ID_B,
+        },
+    )
+
+    assert await repository.upsert_tool_activity(requested) == requested
+    merged = await repository.upsert_tool_activity(completed)
+
+    assert merged.status is ToolActivityStatus.COMPLETED
+    assert merged.started_at == requested.started_at
+    assert merged.arguments_summary == "README.md"
+    assert merged.result_summary == "12 lines"
+    assert merged.last_event_id == ACTIVITY_EVENT_ID_B
+    assert await repository.list_tool_activities(conversation_id) == [merged]
+
+
+@pytest.mark.asyncio
+async def test_upsert_tool_activity_is_idempotent_and_terminal_wins(
+    tmp_path: Path,
+) -> None:
+    repository = await _open_repository(tmp_path / "chat.sqlite3")
+    conversation_id = await _create_conversation(repository, tmp_path)
+    _, run = await repository.begin_run(
+        conversation_id,
+        content="inspect README",
+        session_id=SESSION_ID,
+    )
+    running = _activity(
+        conversation_id=conversation_id,
+        session_id=run.session_id,
+        status=ToolActivityStatus.RUNNING,
+    )
+    completed = running.model_copy(
+        update={
+            "status": ToolActivityStatus.COMPLETED,
+            "finished_at": NOW + timedelta(seconds=1),
+            "last_event_id": ACTIVITY_EVENT_ID_B,
+        },
+    )
+
+    await repository.upsert_tool_activity(running)
+    terminal = await repository.upsert_tool_activity(completed)
+    assert await repository.upsert_tool_activity(completed) == terminal
+    assert await repository.upsert_tool_activity(running) == terminal
+    assert await repository.list_tool_activities(conversation_id) == [terminal]
+
+
+@pytest.mark.asyncio
+async def test_upsert_tool_activity_rejects_conversation_mismatch(
+    tmp_path: Path,
+) -> None:
+    repository = await _open_repository(tmp_path / "chat.sqlite3")
+    conversation_a = await _create_conversation(repository, tmp_path, title="A")
+    conversation_b = await _create_conversation(repository, tmp_path, title="B")
+    _, run = await repository.begin_run(
+        conversation_a,
+        content="inspect README",
+        session_id=SESSION_ID,
+    )
+
+    with pytest.raises(ChatConflictError, match="conversation mismatch"):
+        await repository.upsert_tool_activity(
+            _activity(
+                conversation_id=conversation_b,
+                session_id=run.session_id,
+                status=ToolActivityStatus.RUNNING,
+            ),
+        )
+    assert await repository.list_tool_activities(conversation_a) == []
+
+
+@pytest.mark.asyncio
+async def test_list_tool_activities_is_deterministic_and_requires_conversation(
+    tmp_path: Path,
+) -> None:
+    repository = await _open_repository(tmp_path / "chat.sqlite3")
+    conversation_id = await _create_conversation(repository, tmp_path)
+    _, run = await repository.begin_run(
+        conversation_id,
+        content="inspect project",
+        session_id=SESSION_ID,
+    )
+    later = _activity(
+        conversation_id=conversation_id,
+        session_id=run.session_id,
+        tool_call_id="call-b",
+        status=ToolActivityStatus.RUNNING,
+        started_at=NOW + timedelta(seconds=2),
+    )
+    earlier = _activity(
+        conversation_id=conversation_id,
+        session_id=run.session_id,
+        tool_call_id="call-a",
+        status=ToolActivityStatus.RUNNING,
+        started_at=NOW + timedelta(seconds=1),
+    )
+    await repository.upsert_tool_activity(later)
+    await repository.upsert_tool_activity(earlier)
+
+    assert await repository.list_tool_activities(conversation_id) == [earlier, later]
+    with pytest.raises(ChatNotFoundError):
+        await repository.list_tool_activities(CONVERSATION_ID_B)
+
+
+@pytest.mark.asyncio
+async def test_interrupt_unfinished_marks_running_activity_interrupted(
+    tmp_path: Path,
+) -> None:
+    repository = await _open_repository(tmp_path / "chat.sqlite3")
+    conversation_id = await _create_conversation(repository, tmp_path)
+    _, run = await repository.begin_run(
+        conversation_id,
+        content="inspect project",
+        session_id=SESSION_ID,
+    )
+    await repository.upsert_tool_activity(
+        _activity(
+            conversation_id=conversation_id,
+            session_id=run.session_id,
+            status=ToolActivityStatus.RUNNING,
+        ),
+    )
+
+    assert await repository.interrupt_unfinished() == (1, 0)
+
+    [activity] = await repository.list_tool_activities(conversation_id)
+    assert activity.status is ToolActivityStatus.INTERRUPTED
+    assert activity.finished_at is not None
+    assert (await repository.get_run(run.session_id)).status is RunStatus.INTERRUPTED
 
 
 @pytest.mark.asyncio
@@ -352,7 +619,7 @@ async def test_initialize_rejects_newer_schema_version(tmp_path: Path) -> None:
     repository = ConversationRepository(path)
     await repository.initialize()
     with repository._connect() as connection:
-        connection.execute("PRAGMA user_version = 2")
+        connection.execute("PRAGMA user_version = 8")
         connection.commit()
     with pytest.raises(UnsupportedSchemaVersionError):
         await repository.initialize()
@@ -533,11 +800,18 @@ async def test_initialize_rolls_back_partial_schema_on_failure(
         )
         """,
     )
-    monkeypatch.setattr(repository_module, "_SCHEMA_STATEMENTS", broken_schema)
+    monkeypatch.setattr(
+        chat_schema_module,
+        "CHAT_MIGRATIONS",
+        (
+            Migration(version=1, statements=broken_schema),
+            Migration(version=2, statements=()),
+        ),
+    )
     path = tmp_path / "chat.sqlite3"
     repository = ConversationRepository(path)
     with pytest.raises(sqlite3.OperationalError):
-        repository._initialize_sync()
+        await repository.initialize()
     with repository._connect() as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
         tables = {
@@ -547,6 +821,46 @@ async def test_initialize_rolls_back_partial_schema_on_failure(
             )
         }
     assert "conversations" not in tables
+
+
+@pytest.mark.asyncio
+async def test_initialize_rolls_back_failed_v1_to_v2_migration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "chat.sqlite3"
+    repository = await _open_repository(path)
+    with repository._connect() as connection:
+        connection.execute("DROP INDEX IF EXISTS idx_chat_tool_activities_session_started")
+        connection.execute("DROP TABLE IF EXISTS chat_tool_activities")
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+
+    broken_migration = (
+        "CREATE TABLE chat_tool_activities (session_id TEXT PRIMARY KEY)",
+        "CREATE TABLE chat_tool_activities (session_id TEXT PRIMARY KEY)",
+    )
+    monkeypatch.setattr(
+        chat_schema_module,
+        "CHAT_MIGRATIONS",
+        (
+            Migration(version=1, statements=()),
+            Migration(version=2, statements=broken_migration),
+        ),
+    )
+
+    with pytest.raises(sqlite3.OperationalError):
+        await ConversationRepository(path).initialize()
+
+    with repository._connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'",
+            )
+        }
+    assert "chat_tool_activities" not in tables
 
 
 @pytest.mark.asyncio
@@ -1403,6 +1717,13 @@ async def test_interrupt_unfinished_full_recovery_behavior(tmp_path: Path) -> No
         session_id=SESSION_ID,
     )
     queued_before = await repository.get_run(queued_run.session_id)
+    activity_before = await repository.upsert_tool_activity(
+        _activity(
+            conversation_id=queued_conversation,
+            session_id=queued_run.session_id,
+            status=ToolActivityStatus.RUNNING,
+        ),
+    )
 
     _, running_run = await repository.begin_run(
         running_conversation,
@@ -1475,6 +1796,10 @@ async def test_interrupt_unfinished_full_recovery_behavior(tmp_path: Path) -> No
     assert queued_after.status is RunStatus.INTERRUPTED
     assert queued_after.finished_at is not None
     assert queued_before.status is RunStatus.QUEUED
+    [activity_after] = await repository.list_tool_activities(queued_conversation)
+    assert activity_after.status is ToolActivityStatus.INTERRUPTED
+    assert activity_after.finished_at is not None
+    assert activity_before.status is ToolActivityStatus.RUNNING
 
     running_after = await repository.get_run(running_run.session_id)
     assert running_after.status is RunStatus.INTERRUPTED
@@ -1515,6 +1840,13 @@ async def test_interrupt_unfinished_rolls_back_on_failure(
         session_id=SESSION_ID,
     )
     queued_before = await repository.get_run(queued_run.session_id)
+    activity_before = await repository.upsert_tool_activity(
+        _activity(
+            conversation_id=queued_conversation,
+            session_id=queued_run.session_id,
+            status=ToolActivityStatus.RUNNING,
+        ),
+    )
 
     waiting_run = await _run_to_waiting_approval(
         repository,
@@ -1550,6 +1882,7 @@ async def test_interrupt_unfinished_rolls_back_on_failure(
     assert (await repository.get_run(queued_run.session_id)) == queued_before
     assert (await repository.get_run(waiting_run.session_id)) == waiting_before
     assert (await repository.get_approval(pending_approval.approval_id)) == pending_before
+    assert await repository.list_tool_activities(queued_conversation) == [activity_before]
 
 
 # ── Task 12: conversation state recovery ─────────────────────────────────

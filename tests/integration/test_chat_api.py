@@ -5,6 +5,7 @@ import json
 import re
 import time
 from collections.abc import AsyncGenerator, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
@@ -22,9 +23,11 @@ from agent_foundations.chat.events import ChatEventBroker, encode_chat_sse
 from agent_foundations.chat.models import (
     ChatEvent,
     ChatEventType,
+    ChatToolActivity,
     Conversation,
     PermissionMode,
     RunStatus,
+    ToolActivityStatus,
 )
 from agent_foundations.chat.repository import ConversationRepository
 from agent_foundations.chat.runner import ConversationRunner, direct_executor_factory
@@ -38,11 +41,9 @@ from agent_foundations.runtime.loop import AgentLoop
 from agent_foundations.runtime.redaction import Redactor
 from agent_foundations.runtime.tool_execution import ToolCallExecutor
 from agent_foundations.runtime.trace import EventSink
-from agent_foundations.tools.filesystem.list_directory import ListDirectoryTool
-from agent_foundations.tools.filesystem.path_policy import PathPolicy
-from agent_foundations.tools.registry import ToolRegistry
 from agent_foundations.viewer.app import create_app
 from agent_foundations.viewer.stream import EventBroker
+from tests.unit.tools.registry_helpers import readonly_tool_registry
 
 
 def _require_chat_api() -> Any:
@@ -63,9 +64,7 @@ def _build_runtime_factory(
     ) -> AgentLoop:
         return AgentLoop(
             provider=provider,
-            registry=ToolRegistry(
-                [ListDirectoryTool(PathPolicy(Path(conversation.project_root)))],
-            ),
+            registry=readonly_tool_registry(Path(conversation.project_root)),
             context_builder=ContextBuilder(ContextBudget()),
             event_sink=event_sink,
             config=AgentConfig(max_steps=5),
@@ -518,9 +517,7 @@ def test_active_run_conflicts_return_409(
     ) -> AgentLoop:
         return AgentLoop(
             provider=HangingProvider(),
-            registry=ToolRegistry(
-                [ListDirectoryTool(PathPolicy(Path(conversation.project_root)))],
-            ),
+            registry=readonly_tool_registry(Path(conversation.project_root)),
             context_builder=ContextBuilder(ContextBudget()),
             event_sink=event_sink,
             config=AgentConfig(max_steps=5),
@@ -1022,5 +1019,62 @@ def test_list_conversation_runs_returns_turn_mapping_and_stable_errors(
         malformed = client.get("/api/chat/conversations/not-a-uuid/runs")
         assert malformed.status_code == 422
         missing = client.get(f"/api/chat/conversations/{uuid4()}/runs")
+        assert missing.status_code == 404
+        assert missing.json() == {"detail": "not found"}
+
+
+def test_conversation_activities_endpoint_exact_shape_and_validation(
+    tmp_path: Path,
+    chat_stack: tuple[Any, ConversationRepository, ChatEventBroker, RunSupervisor, Path],
+) -> None:
+    services, repository, _broker, _supervisor, project_root = chat_stack
+    with _make_client(services, tmp_path) as client:
+        conversation_id = _create_conversation_via_api(client, project_root)
+        empty = client.get(f"/api/chat/conversations/{conversation_id}/activities")
+        assert empty.status_code == 200
+        assert empty.json() == []
+
+        _message, run = asyncio.run(
+            repository.begin_run(
+                conversation_id,
+                content="inspect README",
+                session_id=str(uuid4()),
+            ),
+        )
+        activity = ChatToolActivity(
+            conversation_id=conversation_id,
+            session_id=run.session_id,
+            tool_call_id="call-1",
+            tool_name="read_file",
+            status=ToolActivityStatus.COMPLETED,
+            arguments_summary="README.md",
+            result_summary="1 line",
+            started_at=datetime(2026, 8, 8, 12, 0, tzinfo=UTC),
+            finished_at=datetime(2026, 8, 8, 12, 0, 1, tzinfo=UTC),
+            last_event_id=str(uuid4()),
+        )
+        asyncio.run(repository.upsert_tool_activity(activity))
+
+        response = client.get(f"/api/chat/conversations/{conversation_id}/activities")
+        assert response.status_code == 200
+        assert response.json() == [activity.model_dump(mode="json")]
+        assert set(response.json()[0]) == {
+            "conversation_id",
+            "session_id",
+            "tool_call_id",
+            "tool_name",
+            "status",
+            "arguments_summary",
+            "result_summary",
+            "started_at",
+            "finished_at",
+            "last_event_id",
+        }
+        assert "content" not in response.text
+        assert "Traceback" not in response.text
+
+        malformed = client.get("/api/chat/conversations/not-a-uuid/activities")
+        assert malformed.status_code == 422
+        missing = client.get(f"/api/chat/conversations/{uuid4()}/activities")
         assert missing.status_code == 404
         assert missing.json() == {"detail": "not found"}

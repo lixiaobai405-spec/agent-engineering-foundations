@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import timedelta
 
 from agent_foundations.chat.errors import (
     ApprovalUnavailableError,
     ChatConflictError,
+    ChatNotFoundError,
 )
 from agent_foundations.chat.events import ChatEventBroker
 from agent_foundations.chat.models import (
@@ -18,6 +20,26 @@ from agent_foundations.chat.models import (
     utc_now,
 )
 from agent_foundations.chat.repository import ConversationRepository
+from agent_foundations.security.approvals import (
+    AuthorizationApproval,
+    AuthorizationStatus,
+    Clock,
+)
+from agent_foundations.security.approvals import (
+    utc_now as authorization_utc_now,
+)
+from agent_foundations.security.capabilities import (
+    Capability,
+    CapabilityConsumer,
+    CapabilityDeniedError,
+    CapabilityIssuer,
+)
+from agent_foundations.security.models import (
+    PermissionProfileName,
+    PolicyOutcome,
+    PolicyRequest,
+)
+from agent_foundations.security.repository import AuthorizationRepository
 
 
 @dataclass
@@ -35,12 +57,101 @@ class ApprovalCoordinator:
         self,
         repository: ConversationRepository,
         broker: ChatEventBroker,
+        *,
+        authorization_repository: AuthorizationRepository | None = None,
+        authorization_clock: Clock = authorization_utc_now,
     ) -> None:
         self._repository = repository
         self._broker = broker
         self._lock = asyncio.Lock()
         self._waiters: dict[str, _WaiterState] = {}
         self._shutting_down = False
+        security_repository = authorization_repository or AuthorizationRepository(
+            repository._database,
+        )
+        self._authorization_repository = security_repository
+        self._authorization_approval = AuthorizationApproval(
+            security_repository,
+            PermissionProfileName.ASK_ALWAYS,
+            clock=authorization_clock,
+        )
+        self._capability_issuer = CapabilityIssuer(
+            security_repository,
+            PermissionProfileName.ASK_ALWAYS,
+            ttl=timedelta(minutes=5),
+            clock=authorization_clock,
+        )
+        self._capability_consumer = CapabilityConsumer(
+            security_repository,
+            clock=authorization_clock,
+        )
+
+    async def request_capability(
+        self,
+        request: ApprovalRequest,
+        policy_request: PolicyRequest,
+        outcome: PolicyOutcome,
+    ) -> Capability | None:
+        pending = await self._authorization_approval.request(
+            policy_request,
+            authorization_id=request.approval_id,
+        )
+        legacy_status = await self._resolved_legacy_status(request)
+        if legacy_status is None:
+            try:
+                legacy_status = await self.request(request)
+            except BaseException:
+                await self._authorization_repository.invalidate_pending(
+                    pending.authorization_id,
+                    decided_at=authorization_utc_now(),
+                )
+                raise
+
+        status = (
+            AuthorizationStatus.APPROVED
+            if legacy_status is ApprovalStatus.APPROVED
+            else AuthorizationStatus.DENIED
+        )
+        decision = self._authorization_approval.decide(pending, status)
+        try:
+            return await self._capability_issuer.issue(
+                policy_request,
+                outcome,
+                decision,
+            )
+        except CapabilityDeniedError:
+            return None
+
+    async def _resolved_legacy_status(
+        self,
+        request: ApprovalRequest,
+    ) -> ApprovalStatus | None:
+        try:
+            existing = await self._repository.get_approval(request.approval_id)
+        except ChatNotFoundError:
+            return None
+        exact_binding = (
+            existing.conversation_id == request.conversation_id
+            and existing.session_id == request.session_id
+            and existing.tool_call_id == request.tool_call_id
+            and existing.tool_name == request.tool_name
+            and existing.canonical_path == request.canonical_path
+            and existing.operation is request.operation
+        )
+        if not exact_binding:
+            raise ChatConflictError("legacy approval does not match exact request")
+        if existing.status in {ApprovalStatus.APPROVED, ApprovalStatus.DENIED}:
+            return existing.status
+        if existing.status is ApprovalStatus.PENDING:
+            raise ApprovalUnavailableError("legacy approval is still pending")
+        raise ChatConflictError("legacy approval is invalidated")
+
+    async def consume_capability(
+        self,
+        capability_id: str,
+        execution: PolicyRequest,
+    ) -> Capability:
+        return await self._capability_consumer.consume(capability_id, execution)
 
     async def request(self, request: ApprovalRequest) -> ApprovalStatus:
         if request.status is not ApprovalStatus.PENDING:

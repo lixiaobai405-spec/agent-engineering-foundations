@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent_foundations.chat.models import ChatEvent, ChatEventType
+from agent_foundations.chat.models import ChatEvent, ChatEventType, ToolActivityStatus
 from agent_foundations.runtime.redaction import Redactor
 from agent_foundations.runtime.trace import EventSink, TraceEvent
 
@@ -77,6 +77,7 @@ def projector(redactor: Redactor) -> Any:
     return events.TraceToChatProjector(
         conversation_id=CONVERSATION_ID,
         redactor=redactor,
+        project_root=Path.cwd(),
         max_summary_chars=240,
     )
 
@@ -92,6 +93,7 @@ def test_trace_to_chat_projects_safe_chat_event(
         status="started",
         summary="Calling read_file",
         payload={
+            "tool_call_id": "call-1",
             "name": "read_file",
             "arguments": {
                 "path": str(project_root / "README.md"),
@@ -109,6 +111,7 @@ def test_trace_to_chat_projects_safe_chat_event(
     assert chat_event.type is ChatEventType.TOOL_REQUESTED
     assert chat_event.conversation_id == CONVERSATION_ID
     assert chat_event.session_id == SESSION_ID
+    assert chat_event.event_id == trace_event.event_id
     assert chat_event.occurred_at == trace_event.timestamp
     serialized = chat_event.model_dump_json()
     assert "secret-token" not in serialized
@@ -117,7 +120,15 @@ def test_trace_to_chat_projects_safe_chat_event(
     assert "hidden-value" not in serialized
     assert '"arguments":' not in serialized
     assert "unrelated" not in serialized
-    assert set(chat_event.data.keys()) <= {"name", "arguments_summary", "result_summary", "status"}
+    assert chat_event.data["tool_call_id"] == "call-1"
+    assert chat_event.data["arguments_summary"] == "README.md"
+    assert set(chat_event.data.keys()) <= {
+        "tool_call_id",
+        "name",
+        "arguments_summary",
+        "result_summary",
+        "status",
+    }
 
 
 @pytest.mark.parametrize(
@@ -137,6 +148,7 @@ def test_trace_to_chat_maps_supported_trace_events(
     payload: dict[str, Any] = {"status": "started"}
     if trace_type.startswith("tool.call"):
         payload["name"] = "read_file"
+        payload["tool_call_id"] = "call-1"
     if trace_type == "tool.call.requested":
         payload["arguments"] = {"path": "src"}
     if trace_type in {"tool.call.completed", "tool.call.failed"}:
@@ -191,6 +203,7 @@ def test_trace_to_chat_data_uses_minimal_whitelist(projector: Any) -> None:
             event_type="tool.call.requested",
             status="started",
             payload={
+                "tool_call_id": "call-1",
                 "name": "read_file",
                 "arguments": {"path": "src/auth.py"},
                 "context": "hidden",
@@ -198,7 +211,12 @@ def test_trace_to_chat_data_uses_minimal_whitelist(projector: Any) -> None:
         ),
     )
     assert requested is not None
-    assert set(requested.data.keys()) == {"name", "arguments_summary", "status"}
+    assert set(requested.data.keys()) == {
+        "tool_call_id",
+        "name",
+        "arguments_summary",
+        "status",
+    }
     assert "context" not in requested.data
     assert "arguments" not in requested.data
 
@@ -207,17 +225,25 @@ def test_trace_to_chat_data_uses_minimal_whitelist(projector: Any) -> None:
             event_type="tool.call.completed",
             status="completed",
             payload={
+                "tool_call_id": "call-1",
                 "name": "read_file",
                 "result": {
                     "success": True,
                     "content": "file contents",
-                    "metadata": {"traceback": "hidden stack"},
+                    "metadata": {"returned_lines": 12, "traceback": "hidden stack"},
                 },
             },
         ),
     )
     assert completed is not None
-    assert set(completed.data.keys()) == {"name", "result_summary", "status"}
+    assert set(completed.data.keys()) == {
+        "tool_call_id",
+        "name",
+        "result_summary",
+        "status",
+    }
+    assert completed.data["result_summary"] == "12 lines"
+    assert "file contents" not in completed.model_dump_json()
     assert "result" not in completed.data
 
 
@@ -232,6 +258,7 @@ def test_trace_to_chat_redacts_before_selecting_summary_fields(
     projector = events.TraceToChatProjector(
         conversation_id=CONVERSATION_ID,
         redactor=redactor_with_secret,
+        project_root=project_root,
         max_summary_chars=240,
     )
     absolute_path = str(project_root / "src" / "auth.py")
@@ -239,6 +266,7 @@ def test_trace_to_chat_redacts_before_selecting_summary_fields(
         event_type="tool.call.requested",
         status="Bearer secret-token",
         payload={
+            "tool_call_id": "call-1",
             "name": "read_file",
             "arguments": {
                 "path": absolute_path,
@@ -257,8 +285,82 @@ def test_trace_to_chat_redacts_before_selecting_summary_fields(
     assert absolute_path not in summary
     assert str(project_root) not in summary
     assert "hidden-value" not in summary
-    assert "[REDACTED]" in summary
+    assert summary == "src/auth.py"
     assert chat_event.data["status"] == "Bearer [REDACTED]"
+
+
+@pytest.mark.parametrize(
+    ("name", "result", "expected", "forbidden"),
+    [
+        (
+            "list_directory",
+            {
+                "success": True,
+                "content": json.dumps(
+                    {"path": ".", "entries": [{"name": "secret.py"}], "truncated": False},
+                ),
+                "metadata": {},
+            },
+            "1 entry",
+            "secret.py",
+        ),
+        (
+            "search_text",
+            {
+                "success": True,
+                "content": json.dumps(
+                    {
+                        "query": "secret-token",
+                        "matches": [{"path": "auth.py", "line": "secret-token"}],
+                        "scanned_files": 3,
+                    },
+                ),
+                "metadata": {},
+            },
+            "1 match in 3 files",
+            "auth.py",
+        ),
+    ],
+)
+def test_trace_to_chat_result_summaries_store_counts_not_content(
+    projector: Any,
+    name: str,
+    result: dict[str, Any],
+    expected: str,
+    forbidden: str,
+) -> None:
+    projected = projector.project(
+        _make_trace_event(
+            event_type="tool.call.completed",
+            status="completed",
+            payload={"tool_call_id": "call-1", "name": name, "result": result},
+        ),
+    )
+
+    assert projected is not None
+    assert projected.data["result_summary"] == expected
+    assert forbidden not in projected.model_dump_json()
+    assert "secret-token" not in projected.model_dump_json()
+
+
+def test_trace_to_chat_external_path_is_not_persisted(
+    projector: Any,
+    tmp_path: Path,
+) -> None:
+    projected = projector.project(
+        _make_trace_event(
+            event_type="tool.call.requested",
+            payload={
+                "tool_call_id": "call-1",
+                "name": "read_file",
+                "arguments": {"path": str(tmp_path.parent / "outside.txt")},
+            },
+        ),
+    )
+
+    assert projected is not None
+    assert projected.data["arguments_summary"] == "[external path]"
+    assert str(tmp_path.parent) not in projected.model_dump_json()
 
 
 def test_trace_to_chat_summary_respects_length_limit(redactor: Redactor) -> None:
@@ -266,14 +368,19 @@ def test_trace_to_chat_summary_respects_length_limit(redactor: Redactor) -> None
     projector = events.TraceToChatProjector(
         conversation_id=CONVERSATION_ID,
         redactor=redactor,
+        project_root=Path.cwd(),
         max_summary_chars=20,
     )
-    long_arguments = {"key": "x" * 100}
+    long_arguments = {"query": "x" * 100}
     chat_event = projector.project(
         _make_trace_event(
             event_type="tool.call.requested",
             status="started",
-            payload={"name": "read_file", "arguments": long_arguments},
+            payload={
+                "tool_call_id": "call-1",
+                "name": "search_text",
+                "arguments": long_arguments,
+            },
         ),
     )
     assert chat_event is not None
@@ -287,7 +394,11 @@ def test_trace_to_chat_summary_respects_length_limit(redactor: Redactor) -> None
         _make_trace_event(
             event_type="tool.call.requested",
             status="started",
-            payload={"name": "read_file", "arguments": {"path": "src"}},
+            payload={
+                "tool_call_id": "call-1",
+                "name": "read_file",
+                "arguments": {"path": "src"},
+            },
         ),
     )
     assert short_event is not None
@@ -297,13 +408,22 @@ def test_trace_to_chat_summary_respects_length_limit(redactor: Redactor) -> None
     tiny_projector = events.TraceToChatProjector(
         conversation_id=CONVERSATION_ID,
         redactor=redactor,
+        project_root=Path.cwd(),
         max_summary_chars=1,
     )
     tiny_event = tiny_projector.project(
         _make_trace_event(
             event_type="tool.call.completed",
             status="completed",
-            payload={"name": "read_file", "result": {"success": True, "content": "long"}},
+            payload={
+                "tool_call_id": "call-1",
+                "name": "read_file",
+                "result": {
+                    "success": True,
+                    "content": "never persist this",
+                    "metadata": {"returned_lines": 12},
+                },
+            },
         ),
     )
     assert tiny_event is not None
@@ -332,6 +452,7 @@ def test_trace_to_chat_summary_avoids_double_ellipsis_in_projection(
     projector = events.TraceToChatProjector(
         conversation_id=CONVERSATION_ID,
         redactor=redactor,
+        project_root=Path.cwd(),
         max_summary_chars=6,
     )
     chat_event = projector.project(
@@ -339,8 +460,9 @@ def test_trace_to_chat_summary_avoids_double_ellipsis_in_projection(
             event_type="tool.call.requested",
             status="started",
             payload={
-                "name": "read_file",
-                "arguments": {"msg": "hel…" + "o" * 20},
+                "tool_call_id": "call-1",
+                "name": "search_text",
+                "arguments": {"query": "hel…" + "o" * 20},
             },
         ),
     )
@@ -358,12 +480,14 @@ def test_trace_to_chat_rejects_non_positive_summary_limit(redactor: Redactor) ->
         events.TraceToChatProjector(
             conversation_id=CONVERSATION_ID,
             redactor=redactor,
+            project_root=Path.cwd(),
             max_summary_chars=0,
         )
     with pytest.raises(ValueError, match="max_summary_chars"):
         events.TraceToChatProjector(
             conversation_id=CONVERSATION_ID,
             redactor=redactor,
+            project_root=Path.cwd(),
             max_summary_chars=-1,
         )
 
@@ -374,8 +498,21 @@ async def test_chat_projection_sink_publishes_projected_events_only(
 ) -> None:
     events = _import_events_module()
     broker = AsyncMock()
-    sink = events.ChatProjectionSink(projector=projector, broker=broker)
-    trace_event = _make_trace_event(event_type="tool.call.requested", payload={"name": "read_file"})
+    repository = AsyncMock()
+    repository.upsert_tool_activity.side_effect = lambda activity: activity
+    sink = events.ChatProjectionSink(
+        projector=projector,
+        repository=repository,
+        broker=broker,
+    )
+    trace_event = _make_trace_event(
+        event_type="tool.call.requested",
+        payload={
+            "tool_call_id": "call-1",
+            "name": "read_file",
+            "arguments": {"path": "README.md"},
+        },
+    )
 
     await sink.emit(trace_event)
 
@@ -383,6 +520,9 @@ async def test_chat_projection_sink_publishes_projected_events_only(
     published = broker.publish.await_args.args[0]
     assert isinstance(published, ChatEvent)
     assert published.type is ChatEventType.TOOL_REQUESTED
+    persisted = repository.upsert_tool_activity.await_args.args[0]
+    assert persisted.tool_call_id == "call-1"
+    assert persisted.status is ToolActivityStatus.RUNNING
 
     broker.publish.reset_mock()
     await sink.emit(_make_trace_event(event_type="session.started"))
@@ -395,13 +535,27 @@ async def test_chat_projection_sink_does_not_publish_same_trace_event_twice(
 ) -> None:
     events = _import_events_module()
     broker = AsyncMock()
-    sink = events.ChatProjectionSink(projector=projector, broker=broker)
-    trace_event = _make_trace_event(event_type="tool.call.requested", payload={"name": "read_file"})
+    repository = AsyncMock()
+    repository.upsert_tool_activity.side_effect = lambda activity: activity
+    sink = events.ChatProjectionSink(
+        projector=projector,
+        repository=repository,
+        broker=broker,
+    )
+    trace_event = _make_trace_event(
+        event_type="tool.call.requested",
+        payload={
+            "tool_call_id": "call-1",
+            "name": "read_file",
+            "arguments": {"path": "README.md"},
+        },
+    )
 
     await sink.emit(trace_event)
     await sink.emit(trace_event)
 
     broker.publish.assert_awaited_once()
+    repository.upsert_tool_activity.assert_awaited_once()
 
 
 def test_chat_projection_sink_satisfies_event_sink_protocol() -> None:
@@ -409,21 +563,88 @@ def test_chat_projection_sink_satisfies_event_sink_protocol() -> None:
     broker = events.ChatEventBroker()
     sink = events.ChatProjectionSink(
         projector=AsyncMock(),
+        repository=AsyncMock(),
         broker=broker,
     )
     assert isinstance(sink, EventSink)
 
 
 @pytest.mark.asyncio
-async def test_chat_projection_sink_propagates_broker_errors(projector: Any) -> None:
+async def test_chat_projection_sink_swallows_non_cancel_projection_errors(
+    projector: Any,
+) -> None:
     events = _import_events_module()
     broker = AsyncMock()
     broker.publish.side_effect = RuntimeError("broker failure")
-    sink = events.ChatProjectionSink(projector=projector, broker=broker)
+    repository = AsyncMock()
+    repository.upsert_tool_activity.side_effect = lambda activity: activity
+    sink = events.ChatProjectionSink(
+        projector=projector,
+        repository=repository,
+        broker=broker,
+    )
 
-    with pytest.raises(RuntimeError, match="broker failure"):
+    await sink.emit(
+        _make_trace_event(
+            event_type="tool.call.requested",
+            payload={
+                "tool_call_id": "call-1",
+                "name": "read_file",
+                "arguments": {"path": "README.md"},
+            },
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_chat_projection_sink_persists_before_publish(projector: Any) -> None:
+    events = _import_events_module()
+    call_order: list[str] = []
+    repository = AsyncMock()
+    broker = AsyncMock()
+
+    async def persist(activity: Any) -> Any:
+        call_order.append("persist")
+        return activity
+
+    async def publish(event: Any) -> None:
+        call_order.append("publish")
+
+    repository.upsert_tool_activity.side_effect = persist
+    broker.publish.side_effect = publish
+    sink = events.ChatProjectionSink(projector, repository, broker)
+
+    await sink.emit(
+        _make_trace_event(
+            event_type="tool.call.requested",
+            payload={
+                "tool_call_id": "call-1",
+                "name": "read_file",
+                "arguments": {"path": "README.md"},
+            },
+        ),
+    )
+
+    assert call_order == ["persist", "publish"]
+
+
+@pytest.mark.asyncio
+async def test_chat_projection_sink_reraises_cancellation(projector: Any) -> None:
+    events = _import_events_module()
+    repository = AsyncMock()
+    repository.upsert_tool_activity.side_effect = asyncio.CancelledError
+    sink = events.ChatProjectionSink(projector, repository, AsyncMock())
+
+    with pytest.raises(asyncio.CancelledError):
         await sink.emit(
-            _make_trace_event(event_type="tool.call.requested", payload={"name": "read_file"}),
+            _make_trace_event(
+                event_type="tool.call.requested",
+                payload={
+                    "tool_call_id": "call-1",
+                    "name": "read_file",
+                    "arguments": {"path": "README.md"},
+                },
+            ),
         )
 
 

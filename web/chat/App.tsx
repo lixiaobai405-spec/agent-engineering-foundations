@@ -10,6 +10,7 @@ import {
   getConversation,
   getConversationState,
   listConversations,
+  listActivities,
   listMessages,
   listRuns,
   patchConversation,
@@ -85,6 +86,7 @@ export function App() {
   );
   const messages = activeId ? state.messagesByConversation[activeId] ?? [] : [];
   const runs = activeId ? state.runsByConversation[activeId] ?? [] : [];
+  const activities = activeId ? state.activitiesByConversation[activeId] ?? [] : [];
   const runStatus = activeId ? state.runStatusByConversation[activeId] : undefined;
   const activeSessionId = activeId
     ? state.activeSessionIdByConversation[activeId] ?? null
@@ -94,6 +96,9 @@ export function App() {
     : null;
   const messagesError = activeId
     ? state.messagesErrorByConversation[activeId] ?? null
+    : null;
+  const activitiesError = activeId
+    ? state.activitiesErrorByConversation[activeId] ?? null
     : null;
 
   const isRunActive =
@@ -129,6 +134,34 @@ export function App() {
     void reloadConversations();
   }, [reloadConversations]);
 
+  const refreshActivities = useCallback(
+    async (conversationId: string, epoch: number): Promise<boolean> => {
+      try {
+        const loadedActivities = await listActivities(conversationId);
+        if (epoch !== selectionEpochRef.current) {
+          return false;
+        }
+        dispatch({
+          type: "activities.loaded",
+          conversationId,
+          activities: loadedActivities,
+        });
+        return true;
+      } catch (error) {
+        if (epoch !== selectionEpochRef.current) {
+          return false;
+        }
+        dispatch({
+          type: "activities.error",
+          conversationId,
+          error: errorMessage(error),
+        });
+        return false;
+      }
+    },
+    [],
+  );
+
   useEffect(() => {
     if (typeof window.matchMedia !== "function") {
       return;
@@ -151,6 +184,7 @@ export function App() {
           _conversation,
           messagesForConversation,
           runsForConversation,
+          activityResult,
           conversations,
           conversationState,
         ] =
@@ -158,6 +192,10 @@ export function App() {
             getConversation(conversationId),
             listMessages(conversationId),
             listRuns(conversationId),
+            listActivities(conversationId).then(
+              (loadedActivities) => ({ loadedActivities, error: null }),
+              (error: unknown) => ({ loadedActivities: null, error }),
+            ),
             listConversations(),
             getConversationState(conversationId),
           ]);
@@ -175,6 +213,19 @@ export function App() {
           conversationId,
           runs: runsForConversation,
         });
+        if (activityResult.loadedActivities !== null) {
+          dispatch({
+            type: "activities.loaded",
+            conversationId,
+            activities: activityResult.loadedActivities,
+          });
+        } else {
+          dispatch({
+            type: "activities.error",
+            conversationId,
+            error: errorMessage(activityResult.error),
+          });
+        }
         dispatch({
           type: "conversation.state.loaded",
           conversationId,
@@ -237,6 +288,7 @@ export function App() {
               conversationId,
               state: conversationState,
             });
+            await refreshActivities(conversationId, epoch);
           })();
         }
       },
@@ -259,7 +311,8 @@ export function App() {
         })();
       },
     );
-  }, [restoreConversationHttp]);
+    void refreshActivities(conversationId, epoch);
+  }, [refreshActivities, restoreConversationHttp]);
 
   useEffect(() => {
     if (!activeId) {
@@ -316,7 +369,7 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    const contentToken = `${activeId ?? "none"}:${messages.length}:${activeApproval?.approval_id ?? "none"}:${activeSessionId ?? "none"}`;
+    const contentToken = `${activeId ?? "none"}:${messages.length}:${activities.length}:${activities.at(-1)?.status ?? "none"}:${activeApproval?.approval_id ?? "none"}:${activeSessionId ?? "none"}`;
     if (previousContentTokenRef.current === null) {
       previousContentTokenRef.current = contentToken;
       return;
@@ -327,7 +380,7 @@ export function App() {
         scrollToLatest();
       }
     }
-  }, [activeApproval, activeId, activeSessionId, isFollowingLatest, messages.length, scrollToLatest]);
+  }, [activeApproval, activeId, activeSessionId, activities, isFollowingLatest, messages.length, scrollToLatest]);
 
   async function handleCreate(request: CreateConversationRequest): Promise<void> {
     const created = await createConversation(request);
@@ -377,11 +430,19 @@ export function App() {
         data: { status: "running" },
       },
     });
-    const messagesForConversation = await listMessages(activeId);
+    const [messagesForConversation, runsForConversation] = await Promise.all([
+      listMessages(activeId),
+      listRuns(activeId),
+    ]);
     dispatch({
       type: "messages.loaded",
       conversationId: activeId,
       messages: messagesForConversation,
+    });
+    dispatch({
+      type: "runs.loaded",
+      conversationId: activeId,
+      runs: runsForConversation,
     });
   }
 
@@ -529,12 +590,30 @@ export function App() {
                 <MessageTimeline
                   messages={messages}
                   runs={runs}
+                  activities={activities}
                   activeApproval={activeApproval}
+                  activeSessionId={activeSessionId}
                   isRunActive={isRunActive}
                   onApprovalDecision={handleApprovalDecision}
                   approvalDisabled={false}
                 />
               </div>
+              {activitiesError ? (
+                <div role="status" className="chat-activity-recovery">
+                  <span>Tool activity is temporarily unavailable.</span>
+                  <button
+                    type="button"
+                    aria-label="Retry activity"
+                    onClick={() => {
+                      if (activeId) {
+                        void refreshActivities(activeId, selectionEpochRef.current);
+                      }
+                    }}
+                  >
+                    Retry
+                  </button>
+                </div>
+              ) : null}
               {messagesError ? <p role="alert">{messagesError}</p> : null}
               {!isFollowingLatest ? (
                 <button

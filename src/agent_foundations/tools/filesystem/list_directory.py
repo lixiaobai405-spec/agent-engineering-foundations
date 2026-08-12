@@ -4,7 +4,16 @@ from typing import Any
 
 from agent_foundations.domain.errors import PathPolicyViolationError
 from agent_foundations.domain.tool import ToolResult
+from agent_foundations.security.models import SideEffectKind, ToolManifest
 from agent_foundations.tools.filesystem.path_policy import PathPolicy
+
+LIST_DIRECTORY_MANIFEST = ToolManifest(
+    name="list_directory",
+    resource_kind="project_path",
+    operations=("list",),
+    side_effect=SideEffectKind.NONE,
+    sandbox_required=False,
+)
 
 
 class ListDirectoryTool:

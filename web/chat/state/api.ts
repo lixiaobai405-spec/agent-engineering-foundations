@@ -3,6 +3,7 @@ import type {
   ApprovalRequest,
   ChatEvent,
   ChatMessage,
+  ChatToolActivity,
   Conversation,
   CreateConversationRequest,
   PatchConversationRequest,
@@ -105,6 +106,14 @@ export async function listMessages(conversationId: string): Promise<ChatMessage[
 export async function listRuns(conversationId: string): Promise<RunRecord[]> {
   return requestJson<RunRecord[]>(
     chatUrl(`/conversations/${encodeId(conversationId)}/runs`),
+  );
+}
+
+export async function listActivities(
+  conversationId: string,
+): Promise<ChatToolActivity[]> {
+  return requestJson<ChatToolActivity[]>(
+    chatUrl(`/conversations/${encodeId(conversationId)}/activities`),
   );
 }
 

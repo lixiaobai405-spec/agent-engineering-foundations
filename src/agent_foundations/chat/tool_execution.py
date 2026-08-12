@@ -18,12 +18,33 @@ from agent_foundations.chat.models import (
 from agent_foundations.domain.errors import PathPolicyViolationError
 from agent_foundations.domain.tool import Tool, ToolResult
 from agent_foundations.runtime.tool_execution import ToolExecutionContext
-from agent_foundations.tools.filesystem.list_directory import ListDirectoryTool
+from agent_foundations.security.models import (
+    PermissionProfile,
+    PermissionProfileName,
+    PolicyOutcome,
+    PolicyRequest,
+    PolicyResource,
+    ResourceScope,
+    default_allowed_tools,
+)
+from agent_foundations.security.policy import PolicyEngine
+from agent_foundations.tools.filesystem.list_directory import (
+    LIST_DIRECTORY_MANIFEST,
+    ListDirectoryTool,
+)
 from agent_foundations.tools.filesystem.path_policy import PathPolicy
-from agent_foundations.tools.filesystem.read_file import ReadFileTool
-from agent_foundations.tools.filesystem.search_text import SearchTextTool
+from agent_foundations.tools.filesystem.read_file import READ_FILE_MANIFEST, ReadFileTool
+from agent_foundations.tools.filesystem.search_text import (
+    SEARCH_TEXT_MANIFEST,
+    SearchTextTool,
+)
 
 _EXTERNAL_READ_TOOLS = frozenset({"read_file", "list_directory", "search_text"})
+_EXTERNAL_POLICY_METADATA = {
+    "read_file": (READ_FILE_MANIFEST, "read"),
+    "list_directory": (LIST_DIRECTORY_MANIFEST, "list"),
+    "search_text": (SEARCH_TEXT_MANIFEST, "search"),
+}
 
 
 class FilesystemAccessController:
@@ -103,7 +124,22 @@ class ApprovalAwareToolExecutor:
             operation=AccessOperation.READ,
             status=ApprovalStatus.PENDING,
         )
-        approval_status = await self._coordinator.request(request)
+        policy_request, outcome = self._external_policy_request(
+            tool.name,
+            context,
+            access.canonical_path,
+        )
+        request_capability = getattr(self._coordinator, "request_capability", None)
+        capability = None
+        if request_capability is None:
+            approval_status = await self._coordinator.request(request)
+        else:
+            capability = await request_capability(request, policy_request, outcome)
+            approval_status = (
+                ApprovalStatus.APPROVED
+                if capability is not None
+                else ApprovalStatus.DENIED
+            )
         if approval_status is ApprovalStatus.DENIED:
             return ToolResult(
                 success=False,
@@ -116,6 +152,11 @@ class ApprovalAwareToolExecutor:
         resolved = PathPolicy.resolve_external_read_target(raw_path)
         if str(resolved) != access.canonical_path:
             raise PathPolicyViolationError("approved external target changed")
+        if capability is not None:
+            await self._coordinator.consume_capability(
+                capability.capability_id,
+                policy_request,
+            )
         prepared = self._prepare_scoped_execution(tool.name, resolved, arguments)
         if isinstance(prepared, ToolResult):
             return prepared
@@ -167,6 +208,36 @@ class ApprovalAwareToolExecutor:
                 rewritten["path"] = target.name
             return SearchTextTool(policy), rewritten
         raise PathPolicyViolationError("tool cannot receive external read access")
+
+    @staticmethod
+    def _external_policy_request(
+        tool_name: str,
+        context: ToolExecutionContext,
+        canonical_path: str,
+    ) -> tuple[PolicyRequest, PolicyOutcome]:
+        metadata = _EXTERNAL_POLICY_METADATA.get(tool_name)
+        if metadata is None:
+            raise PathPolicyViolationError("tool cannot receive external read access")
+        manifest, operation = metadata
+        profile = PermissionProfile(
+            name=PermissionProfileName.ASK_ALWAYS,
+            version=1,
+            allowed_tools=default_allowed_tools(PermissionProfileName.ASK_ALWAYS),
+        )
+        request = PolicyRequest(
+            profile_version=profile.version,
+            run_id=context.session_id,
+            tool_call_id=context.tool_call_id,
+            tool_name=tool_name,
+            manifest=manifest,
+            resource=PolicyResource(
+                kind="project_path",
+                scope=ResourceScope.EXTERNAL_EXACT_PATH,
+                identifier=canonical_path,
+            ),
+            operation=operation,
+        )
+        return request, PolicyEngine().decide(profile, request)
 
 
 def _is_absolute_request(raw_path: str) -> bool:

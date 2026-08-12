@@ -2,7 +2,16 @@ from typing import Any
 
 from agent_foundations.domain.errors import BinaryFileError, FileTooLargeError
 from agent_foundations.domain.tool import ToolResult
+from agent_foundations.security.models import SideEffectKind, ToolManifest
 from agent_foundations.tools.filesystem.path_policy import PathPolicy
+
+READ_FILE_MANIFEST = ToolManifest(
+    name="read_file",
+    resource_kind="project_path",
+    operations=("read",),
+    side_effect=SideEffectKind.NONE,
+    sandbox_required=False,
+)
 
 
 class ReadFileTool:

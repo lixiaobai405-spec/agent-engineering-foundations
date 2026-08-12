@@ -5,6 +5,7 @@ import type {
   ApprovalRequest,
   ChatEvent,
   ChatMessage,
+  ChatToolActivity,
   Conversation,
   RunRecord,
 } from "../../web/chat/state/types";
@@ -25,6 +26,19 @@ const CONVERSATION_B: Conversation = {
   permission_mode: "ASK_FOR_ACCESS",
   created_at: "2026-08-02T00:00:00Z",
   updated_at: "2026-08-02T00:01:00Z",
+};
+
+const RUNNING_ACTIVITY: ChatToolActivity = {
+  conversation_id: CONVERSATION_A.conversation_id,
+  session_id: "33333333-3333-4333-8333-333333333333",
+  tool_call_id: "call-1",
+  tool_name: "read_file",
+  status: "running",
+  arguments_summary: "README.md",
+  result_summary: null,
+  started_at: "2026-08-02T00:00:01Z",
+  finished_at: null,
+  last_event_id: "55555555-5555-4555-8555-555555555555",
 };
 
 function makeEvent(
@@ -64,7 +78,7 @@ describe("reduceChatState", () => {
     const next = reduceChatState(selected, { type: "event.received", event: running });
     expect(next.activeConversationId).toBe(CONVERSATION_A.conversation_id);
     expect(next.runStatusByConversation[CONVERSATION_A.conversation_id]).toBe("running");
-    expect(next.activitiesByConversation[CONVERSATION_A.conversation_id]).toEqual([running]);
+    expect(next.activitiesByConversation[CONVERSATION_A.conversation_id] ?? []).toEqual([]);
   });
 
   it("selects the first conversation when loading a non-empty list", () => {
@@ -146,7 +160,11 @@ describe("reduceChatState", () => {
       event: makeEvent({
         conversation_id: CONVERSATION_A.conversation_id,
         type: "tool.requested",
-        data: { name: "read_file" },
+        data: {
+          tool_call_id: "call-1",
+          name: "read_file",
+          arguments_summary: "README.md",
+        },
       }),
     });
     const selectedB = selectConversation(withActivityA, CONVERSATION_B.conversation_id);
@@ -154,6 +172,65 @@ describe("reduceChatState", () => {
     expect(selectedB.activitiesByConversation[CONVERSATION_B.conversation_id] ?? []).toEqual([]);
     expect(selectedB.messagesByConversation[CONVERSATION_A.conversation_id]).toHaveLength(1);
     expect(selectedB.activitiesByConversation[CONVERSATION_A.conversation_id]).toHaveLength(1);
+  });
+
+  it("merges loaded and live activity by session and tool call with terminal precedence", () => {
+    const loaded = reduceChatState(initialState, {
+      type: "activities.loaded",
+      conversationId: CONVERSATION_A.conversation_id,
+      activities: [RUNNING_ACTIVITY],
+    });
+    const completed = reduceChatState(loaded, {
+      type: "event.received",
+      event: makeEvent({
+        event_id: "66666666-6666-4666-8666-666666666666",
+        conversation_id: CONVERSATION_A.conversation_id,
+        type: "tool.completed",
+        data: {
+          tool_call_id: "call-1",
+          name: "read_file",
+          result_summary: "1 line",
+        },
+      }),
+    });
+    const staleReplay = reduceChatState(completed, {
+      type: "event.received",
+      event: makeEvent({
+        conversation_id: CONVERSATION_A.conversation_id,
+        type: "tool.requested",
+        data: {
+          tool_call_id: "call-1",
+          name: "read_file",
+          arguments_summary: "README.md",
+        },
+      }),
+    });
+
+    expect(staleReplay.activitiesByConversation[CONVERSATION_A.conversation_id]).toEqual([
+      expect.objectContaining({
+        status: "completed",
+        arguments_summary: "README.md",
+        result_summary: "1 line",
+        started_at: RUNNING_ACTIVITY.started_at,
+      }),
+    ]);
+  });
+
+  it("keeps activity errors conversation scoped and clears them on recovery", () => {
+    const failed = reduceChatState(initialState, {
+      type: "activities.error",
+      conversationId: CONVERSATION_A.conversation_id,
+      error: "temporarily unavailable",
+    });
+    expect(failed.activitiesErrorByConversation[CONVERSATION_A.conversation_id]).toBe(
+      "temporarily unavailable",
+    );
+    const recovered = reduceChatState(failed, {
+      type: "activities.loaded",
+      conversationId: CONVERSATION_A.conversation_id,
+      activities: [],
+    });
+    expect(recovered.activitiesErrorByConversation[CONVERSATION_A.conversation_id]).toBeNull();
   });
 
   it("merges assistant.message.completed into the current conversation", () => {
@@ -359,7 +436,11 @@ describe("reduceChatState", () => {
       event: makeEvent({
         conversation_id: CONVERSATION_B.conversation_id,
         type: "tool.requested",
-        data: { name: "read_file" },
+        data: {
+          tool_call_id: "call-other-conversation",
+          name: "read_file",
+          arguments_summary: "README.md",
+        },
       }),
     });
     expect(next.activitiesByConversation[CONVERSATION_B.conversation_id]).toHaveLength(1);

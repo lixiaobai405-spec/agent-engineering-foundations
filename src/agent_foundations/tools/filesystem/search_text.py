@@ -9,8 +9,17 @@ from agent_foundations.domain.errors import (
     PathPolicyViolationError,
 )
 from agent_foundations.domain.tool import ToolResult
+from agent_foundations.security.models import SideEffectKind, ToolManifest
 from agent_foundations.tools.filesystem.path_policy import PathPolicy
 from agent_foundations.tools.filesystem.read_file import ReadFileTool
+
+SEARCH_TEXT_MANIFEST = ToolManifest(
+    name="search_text",
+    resource_kind="project_path",
+    operations=("search",),
+    side_effect=SideEffectKind.NONE,
+    sandbox_required=False,
+)
 
 
 class SearchTextTool:

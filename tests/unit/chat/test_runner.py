@@ -14,21 +14,21 @@ from agent_foundations.chat.models import (
     MessageRole,
     PermissionMode,
     RunStatus,
+    ToolActivityStatus,
 )
 from agent_foundations.chat.repository import ConversationRepository
 from agent_foundations.context.budget import ContextBudget
 from agent_foundations.context.builder import ContextBuilder
 from agent_foundations.domain.messages import Role
 from agent_foundations.domain.model import ModelResponse
+from agent_foundations.domain.tool import ToolCall
 from agent_foundations.providers.fake import FakeModelProvider
 from agent_foundations.runtime.agent import AgentConfig
 from agent_foundations.runtime.loop import AgentLoop
 from agent_foundations.runtime.redaction import Redactor
 from agent_foundations.runtime.tool_execution import ToolCallExecutor
 from agent_foundations.runtime.trace import EventSink
-from agent_foundations.tools.filesystem.list_directory import ListDirectoryTool
-from agent_foundations.tools.filesystem.path_policy import PathPolicy
-from agent_foundations.tools.registry import ToolRegistry
+from tests.unit.tools.registry_helpers import readonly_tool_registry
 
 CONVERSATION_ID = "11111111-1111-4111-8111-111111111111"
 SESSION_ID = "22222222-2222-4222-8222-222222222222"
@@ -96,9 +96,7 @@ def _build_runtime_factory(
     ) -> AgentLoop:
         return AgentLoop(
             provider=provider,
-            registry=ToolRegistry(
-                [ListDirectoryTool(PathPolicy(Path(conversation.project_root)))],
-            ),
+            registry=readonly_tool_registry(Path(conversation.project_root)),
             context_builder=ContextBuilder(ContextBudget()),
             event_sink=event_sink,
             config=AgentConfig(max_steps=5),
@@ -190,6 +188,109 @@ async def test_runner_completes_turn_with_history_and_fixed_session(
 
 
 @pytest.mark.asyncio
+async def test_runner_persists_tool_activity_without_raw_result(
+    tmp_path: Path,
+) -> None:
+    ConversationRunner, direct_executor_factory = _require_runner_types()
+    repository, conversation, _project_root = await _prepare_conversation(tmp_path)
+    user_message, _run = await repository.begin_run(
+        conversation.conversation_id,
+        content="list project",
+        session_id=SESSION_ID,
+    )
+    provider = FakeModelProvider(
+        [
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        id="call-1",
+                        name="list_directory",
+                        arguments={"path": "."},
+                    ),
+                ),
+            ),
+            ModelResponse(content="done"),
+        ],
+    )
+    runner = ConversationRunner(
+        repository=repository,
+        broker=RecordingBroker(repository, SESSION_ID),
+        runtime_factory=_build_runtime_factory(provider),
+        trace_dir=tmp_path / "traces",
+        redactor_factory=lambda item: Redactor(Path(item.project_root)),
+        tool_executor_factory=direct_executor_factory,
+    )
+
+    await runner.run_turn(
+        conversation.conversation_id,
+        SESSION_ID,
+        user_message.message_id,
+        "list project",
+    )
+
+    [activity] = await repository.list_tool_activities(conversation.conversation_id)
+    assert activity.status is ToolActivityStatus.COMPLETED
+    assert activity.tool_call_id == "call-1"
+    assert activity.arguments_summary == "."
+    assert activity.result_summary == "1 entry"
+    serialized = activity.model_dump_json()
+    assert "README.md" not in serialized
+    assert '"entries"' not in serialized
+
+
+@pytest.mark.asyncio
+async def test_runner_chat_projection_failure_does_not_fail_runtime(
+    tmp_path: Path,
+) -> None:
+    ConversationRunner, direct_executor_factory = _require_runner_types()
+    repository, conversation, _project_root = await _prepare_conversation(tmp_path)
+    user_message, _run = await repository.begin_run(
+        conversation.conversation_id,
+        content="list project",
+        session_id=SESSION_ID,
+    )
+
+    class ProjectionFailingRepository:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(repository, name)
+
+        async def upsert_tool_activity(self, activity: Any) -> Any:
+            raise RuntimeError("projection-storage-secret")
+
+    provider = FakeModelProvider(
+        [
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(id="call-1", name="list_directory", arguments={"path": "."}),
+                ),
+            ),
+            ModelResponse(content="done despite projection failure"),
+        ],
+    )
+    runner = ConversationRunner(
+        repository=ProjectionFailingRepository(),
+        broker=RecordingBroker(repository, SESSION_ID),
+        runtime_factory=_build_runtime_factory(provider),
+        trace_dir=tmp_path / "traces",
+        redactor_factory=lambda item: Redactor(Path(item.project_root)),
+        tool_executor_factory=direct_executor_factory,
+    )
+
+    await runner.run_turn(
+        conversation.conversation_id,
+        SESSION_ID,
+        user_message.message_id,
+        "list project",
+    )
+
+    completed = await repository.get_run(SESSION_ID)
+    assert completed.status is RunStatus.COMPLETED
+    trace_text = (tmp_path / "traces" / f"{SESSION_ID}.jsonl").read_text("utf-8")
+    assert "tool.call.completed" in trace_text
+    assert "projection-storage-secret" not in trace_text
+
+
+@pytest.mark.asyncio
 async def test_runner_provider_failure_marks_failed_without_exposing_text(
     tmp_path: Path,
 ) -> None:
@@ -260,9 +361,7 @@ async def test_runner_cancellation_marks_interrupted_and_reraises(
     ) -> AgentLoop:
         return AgentLoop(
             provider=HangingProvider(),
-            registry=ToolRegistry(
-                [ListDirectoryTool(PathPolicy(Path(conversation.project_root)))],
-            ),
+            registry=readonly_tool_registry(Path(conversation.project_root)),
             context_builder=ContextBuilder(ContextBudget()),
             event_sink=event_sink,
             config=AgentConfig(max_steps=5),

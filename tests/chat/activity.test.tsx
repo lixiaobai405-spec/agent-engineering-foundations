@@ -2,11 +2,16 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
-import { ActivityCard } from "../../web/chat/components/ActivityCard";
 import { ApprovalCard } from "../../web/chat/components/ApprovalCard";
+import { ToolActivityGroup } from "../../web/chat/components/ToolActivityGroup";
 import { parseApprovalFromEvent } from "../../web/chat/components/ApprovalCard";
 import { ChatApiError } from "../../web/chat/state/api";
-import type { ActiveApproval, ChatEvent } from "../../web/chat/state/types";
+import type {
+  ActiveApproval,
+  ChatEvent,
+  ChatToolActivity,
+  RunRecord,
+} from "../../web/chat/state/types";
 
 function makeEvent(
   overrides: Partial<ChatEvent> & Pick<ChatEvent, "type" | "conversation_id">,
@@ -19,56 +24,6 @@ function makeEvent(
     ...overrides,
   };
 }
-
-describe("ActivityCard", () => {
-  it("shows only safe projected summary fields with expand control", async () => {
-    const user = userEvent.setup();
-    const event = makeEvent({
-      conversation_id: "11111111-1111-4111-8111-111111111111",
-      type: "tool.requested",
-      data: {
-        name: "read_file",
-        status: "started",
-        arguments_summary: "path=README.md",
-        secret: "must-not-render",
-      },
-    });
-
-    render(<ActivityCard event={event} />);
-
-    expect(screen.getByText("Tool requested")).toBeInTheDocument();
-    expect(screen.getByText("read_file")).toBeInTheDocument();
-    expect(screen.getByText("started")).toBeInTheDocument();
-    expect(screen.getByText("path=README.md")).toBeInTheDocument();
-    expect(screen.queryByText("must-not-render")).not.toBeInTheDocument();
-    expect(screen.queryByText(/secret/i)).not.toBeInTheDocument();
-
-    await user.click(screen.getByRole("button", { name: "Expand activity details" }));
-    const details = screen.getByTestId("activity-details");
-    expect(within(details).getByText("path=README.md")).toBeInTheDocument();
-    expect(within(details).queryByText("must-not-render")).not.toBeInTheDocument();
-  });
-
-  it("renders a trace link for run.completed using the event session_id", () => {
-    const sessionId = "22222222-2222-4222-8222-222222222222";
-    render(
-      <ActivityCard
-        event={makeEvent({
-          conversation_id: "11111111-1111-4111-8111-111111111111",
-          session_id: sessionId,
-          type: "run.completed",
-          data: { status: "completed" },
-        })}
-      />,
-    );
-
-    const link = screen.getByRole("link", { name: "Open trace" });
-    expect(link).toHaveAttribute(
-      "href",
-      `/trace?session_id=${encodeURIComponent(sessionId)}`,
-    );
-  });
-});
 
 describe("ApprovalCard", () => {
   const approvalView: ActiveApproval = {
@@ -157,5 +112,124 @@ describe("ApprovalCard", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("conflict");
     expect(screen.getByRole("button", { name: "Approve once" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Deny" })).toBeDisabled();
+  });
+});
+
+describe("ToolActivityGroup", () => {
+  const run: RunRecord = {
+    session_id: "33333333-3333-4333-8333-333333333333",
+    conversation_id: "11111111-1111-4111-8111-111111111111",
+    user_message_id: "user-1",
+    trace_path: "traces/session.jsonl",
+    assistant_message_id: null,
+    status: "completed",
+    error_code: null,
+    created_at: "2026-08-08T00:00:00Z",
+    started_at: "2026-08-08T00:00:01Z",
+    finished_at: "2026-08-08T00:00:03Z",
+  };
+  const activities: ChatToolActivity[] = [
+    {
+      conversation_id: run.conversation_id,
+      session_id: run.session_id,
+      tool_call_id: "call-1",
+      tool_name: "read_file",
+      status: "completed",
+      arguments_summary: "README.md",
+      result_summary: "10 lines",
+      started_at: "2026-08-08T00:00:01Z",
+      finished_at: "2026-08-08T00:00:02Z",
+      last_event_id: "event-1",
+    },
+    {
+      conversation_id: run.conversation_id,
+      session_id: run.session_id,
+      tool_call_id: "call-2",
+      tool_name: "search_text",
+      status: "failed",
+      arguments_summary: "authenticate",
+      result_summary: "not found",
+      started_at: "2026-08-08T00:00:02Z",
+      finished_at: "2026-08-08T00:00:03Z",
+      last_event_id: "event-2",
+    },
+  ];
+
+  it("collapses terminal runs by default and preserves a manual override", async () => {
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <ToolActivityGroup
+        run={run}
+        activities={activities}
+        approval={null}
+        approvalDisabled={false}
+        onApprovalDecision={vi.fn()}
+      />,
+    );
+    const toggle = screen.getByRole("button", { name: /2 tool activities/i });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("README.md")).not.toBeInTheDocument();
+
+    await user.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("README.md")).toBeInTheDocument();
+    expect(screen.getByText("failed")).toBeInTheDocument();
+
+    rerender(
+      <ToolActivityGroup
+        run={{ ...run, status: "running" }}
+        activities={activities}
+        approval={null}
+        approvalDisabled={false}
+        onApprovalDecision={vi.fn()}
+      />,
+    );
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("expands active runs and nests approval under the exact tool row", () => {
+    const approval: ActiveApproval = {
+      approval_id: "approval-1",
+      tool_call_id: "call-2",
+      tool_name: "search_text",
+      canonical_path: "D:\\external\\note.txt",
+      operation: "read",
+      scope: "external_exact_path",
+    };
+    render(
+      <ToolActivityGroup
+        run={{ ...run, status: "waiting_approval" }}
+        activities={activities}
+        approval={approval}
+        approvalDisabled={false}
+        onApprovalDecision={vi.fn()}
+      />,
+    );
+    const toggle = screen.getByRole("button", { name: /2 tool activities/i });
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    const rows = screen.getAllByRole("listitem");
+    expect(within(rows[0]!).queryByRole("article", { name: "Approval request" })).toBeNull();
+    expect(within(rows[1]!).getByRole("article", { name: "Approval request" })).toBeInTheDocument();
+  });
+
+  it("renders one fallback approval when no matching activity exists", () => {
+    const approval: ActiveApproval = {
+      approval_id: "approval-missing",
+      tool_call_id: "missing-call",
+      tool_name: "read_file",
+      canonical_path: "D:\\external\\missing.txt",
+      operation: "read",
+      scope: "external_exact_path",
+    };
+    render(
+      <ToolActivityGroup
+        run={{ ...run, status: "waiting_approval" }}
+        activities={activities}
+        approval={approval}
+        approvalDisabled={false}
+        onApprovalDecision={vi.fn()}
+      />,
+    );
+    expect(screen.getAllByRole("article", { name: "Approval request" })).toHaveLength(1);
   });
 });

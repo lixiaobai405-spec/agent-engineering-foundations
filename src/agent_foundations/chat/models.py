@@ -103,6 +103,17 @@ class RunStatus(StrEnum):
         return {cls.QUEUED, cls.RUNNING, cls.WAITING_APPROVAL}
 
 
+class ToolActivityStatus(StrEnum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+
+    @classmethod
+    def terminal(cls) -> set["ToolActivityStatus"]:
+        return {cls.COMPLETED, cls.FAILED, cls.INTERRUPTED}
+
+
 class ApprovalStatus(StrEnum):
     PENDING = "pending"
     APPROVED = "approved"
@@ -180,6 +191,19 @@ class RunRecord(ChatModel):
     created_at: UTCDateTime = Field(default_factory=utc_now)
     started_at: UTCDateTime | None = None
     finished_at: UTCDateTime | None = None
+
+
+class ChatToolActivity(ChatModel):
+    conversation_id: UUIDString
+    session_id: UUIDString
+    tool_call_id: str = Field(min_length=1)
+    tool_name: str = Field(min_length=1)
+    status: ToolActivityStatus
+    arguments_summary: str | None = Field(default=None, max_length=240)
+    result_summary: str | None = Field(default=None, max_length=240)
+    started_at: UTCDateTime
+    finished_at: UTCDateTime | None = None
+    last_event_id: UUIDString
 
 
 class ApprovalRequest(ChatModel):

@@ -9,13 +9,17 @@ Phase 1D 把 Agent 交互拆成两个平面：
 | **Control plane（Chat）** | 多轮对话、权限模式、审批决策、活动摘要 | SQLite（`.agent-foundations/chat.sqlite3`） | SSE（活动提示，非 durable log） |
 | **Observation plane（Trace）** | 完整但已脱敏的 step 时间线、工具参数与结果 | JSONL（`traces/`） | Viewer SSE（历史 + 实时追加） |
 
-Chat UI 只展示安全摘要：Thinking、tool requested/completed、审批卡片、最终回答。完整 Provider 内容、原始 ToolResult 和完整 Trace payload 只在 Trace Viewer 的 `/trace?session_id=...` 中查看。
+Chat UI 只展示持久化且脱敏的工具摘要、审批卡片和最终回答。每个 run 的 tool activity 折叠成一组；完整 Provider 内容、原始 ToolResult 和完整 Trace payload 只在 Trace Viewer 的 `/trace?conversation_id=...&session_id=...` 中查看。
 
 ## SQLite 与 JSONL 的事实所有权
 
-- **SQLite** 拥有 conversation、message、run、approval 等控制面状态。浏览器刷新、HTTP 恢复和 Repository 查询都以 SQLite 为准。
+- **SQLite** 拥有 conversation、message、run、approval，以及可替换的脱敏 tool activity UI 投影。浏览器刷新、HTTP 恢复和 Repository 查询都以 SQLite 为准。
 - **JSONL** 拥有 Agent Runtime 的逐步 TraceEvent。一个 turn 的 `session_id` 同时关联 SQLite run 与 JSONL 文件。
-- **SSE** 只是当前浏览器生命周期的实时提示：连接断开或页面刷新后，不能依赖 SSE 回放历史；必须先通过 HTTP 读取 SQLite 事实，再建立新的 SSE 连接接收后续 live events。
+- **SSE** 只是当前浏览器生命周期的实时提示：连接断开或页面刷新后，不能依赖 SSE 回放历史；必须先通过 HTTP 读取 SQLite 事实，再建立新的 SSE 连接接收后续 live events，并立即通过 activity HTTP catch-up 关闭 snapshot 与订阅之间的窗口。
+
+JSONL 写入先于 Chat 投影。tool activity 投影失败只会被记录，不会反向使 Agent run 失败；因此 JSONL 仍是完整 observability record，SQLite activity 只是安全、可重建但不从 JSONL 临时合成的 UI read model。
+
+`(session_id, tool_call_id)` 是 activity 的幂等键：同一次工具调用的 requested/completed/failed 更新同一行，terminal 状态不会被迟到的 running 事件降级。服务重启时未完成 run 与 activity 一起变为 `interrupted`。
 
 ## ConversationRunner 与 RunSupervisor
 
@@ -59,11 +63,18 @@ GET /api/chat/conversations/{conversation_id}/state
 前端 **fresh load / reload / SSE reconnect** 的顺序：
 
 1. list conversations
-2. get conversation + list messages + get `/state`
-3. 三类 HTTP 恢复均成功后才构造 `EventSource`
-4. SSE 只接收恢复之后的新 live events，不伪造历史 `ChatEvent`
+2. get conversation + list messages + list runs + list activities + get `/state`
+3. 核心 HTTP 恢复完成后才构造 `EventSource`；activity 失败不阻塞消息阅读，并提供 conversation-scoped retry
+4. SSE 连接后立即再取一次 activities，合并期间坚持 terminal-over-running
+5. SSE 只接收 live events，不伪造历史 `ChatEvent`
 
 Reducer 使用独立的 `conversation.state.loaded` action，不把 HTTP 恢复伪装成 SSE `event.received`。
+
+## 为什么 Markdown 不直接渲染 HTML
+
+Chat message 先解析为 Markdown AST/token，再映射到受控 React 元素；GFM table、task list、blockquote、inline code 等保留语义，但 raw HTML、图片、媒体和危险 URL 被阻断。代码高亮使用 Shiki token API 返回文本 token，再渲染为 React `<span>`，不使用 `dangerouslySetInnerHTML` 或 `rehype-raw`。
+
+这个边界同时解决两件事：模型输出更易读，但模型返回的字符串仍只是数据，不能变成可执行 DOM。解析或高亮失败时分别回退到 plain text 和原始 `<code>`，不会让消息消失。
 
 ## `/state` 为什么只恢复 latest run / pending approval
 

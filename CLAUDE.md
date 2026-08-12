@@ -8,7 +8,7 @@
 
 本项目以系统学习 Agent Engineering（智能体工程）为第一目标。
 
-当前目标是从零实现一个可测试、可观察、安全受控的 Python Agent Runtime（智能体运行时），并以只读代码分析 Agent 作为第一阶段产品验证。
+当前目标是从零实现一个可测试、可观察、安全受控的 Python Agent Runtime（智能体运行时）。第一阶段已用只读代码分析 Agent 和本机 Chat 控制面完成产品验证；第二阶段将以可控 Coding Agent 验证规划、持久化执行、受控写入和隔离命令反馈。
 
 学习优先于交付速度：
 
@@ -22,10 +22,12 @@
 执行前按以下顺序阅读：
 
 1. `docs/agent-plans/2026-07-20-agent-engineering-learning-design.md`
-2. `docs/agent-plans/2026-07-21-phase-1-implementation-plan.md`
-3. `docs/agent-plans/2026-08-02-phase-1d-interactive-chat-ui-design.md`
-4. `docs/agent-plans/2026-08-02-phase-1d-interactive-chat-ui-plan.md`
-5. 当前被用户明确指定执行的 Task
+2. `docs/agent-plans/2026-08-08-phase-2-controllable-coding-agent-design.md`
+3. `docs/agent-plans/2026-08-08-phase-2-controllable-coding-agent-plan.md`
+4. `docs/agent-plans/2026-07-21-phase-1-implementation-plan.md`
+5. `docs/agent-plans/2026-08-02-phase-1d-interactive-chat-ui-design.md`
+6. `docs/agent-plans/2026-08-02-phase-1d-interactive-chat-ui-plan.md`
+7. 当前由 planner 单独生成且经用户确认的 Task 执行 prompt
 
 第一阶段计划：
 
@@ -33,6 +35,12 @@
 - Phase 1B：`docs/agent-plans/2026-07-21-phase-1b-readonly-agent-plan.md`
 - Phase 1C：`docs/agent-plans/2026-07-21-phase-1c-trace-viewer-plan.md`
 - Phase 1D：`docs/agent-plans/2026-08-02-phase-1d-interactive-chat-ui-plan.md`
+
+第二阶段设计：
+
+- Phase 2：`docs/agent-plans/2026-08-08-phase-2-controllable-coding-agent-design.md`
+- Phase 2 实施：`docs/agent-plans/2026-08-08-phase-2-controllable-coding-agent-plan.md`
+- Phase 2 详细实施计划已生成，但尚无经用户确认的单 Task 执行 prompt；不得自行开始实现。
 
 优先级：
 
@@ -46,30 +54,29 @@
 
 ## 3. 当前阶段边界
 
-Phase 1A 已于 2026-07-25 通过用户验收，Phase 1B 与 Phase 1C 已于 2026-08-01 通过用户验收。
-当前阶段为 Phase 1D。每次 Claude Code 会话只能执行用户当前明确指定的一个 Task；真实进度以 Phase 1D 计划中的已验证复选框和用户验收为准，不在本文件中固定某个 Task 为永久当前任务。
+Phase 1A 已于 2026-07-25 通过用户验收，Phase 1B 与 Phase 1C 已于 2026-08-01 通过用户验收，Phase 1D 与第一阶段总体验收已于 2026-08-08 由用户确认通过。
 
-Phase 1D 允许实现：
+当前阶段为 Phase 2“可控 Coding Agent”的实施准备阶段。Phase 2 详细实施计划已生成，但没有已授权的实现 Task；用户将另行让 planner 为单个 Task 生成执行 prompt。在 prompt 获得用户确认前，不得修改生产代码或自行选择 Phase 2A 的第一个 Task。未来每次 Claude Code 会话仍只能执行用户当前明确指定的一个 Task，真实进度以已确认实施计划、Task evidence、独立验收和用户确认共同为准。
 
-- Chat 领域模型、SQLite 持久化、FastAPI Chat API 与 SSE
-- React + TypeScript + Vite 本机 Chat UI（只绑定 `127.0.0.1`）
-- `PROJECT_READ_ONLY` 与 `ASK_FOR_ACCESS` 两种只读权限模式
-- 项目外只读访问的一次性精确审批，不提供永久授权
-- Chat 与现有 Trace Viewer、JSONL Trace 的关联和安全事件投影
-- 单元测试、集成测试、浏览器端到端测试
-- Ruff、mypy、Viewer/Chat TypeScript 测试、类型检查与构建
-- `README.md` 与 `docs/learning-notes/04-chat-control-plane.md`
+Phase 2 按顺序分为四个权限递增的子里程碑：
 
-Phase 1D 禁止提前实现：
+- Phase 2A：Offline Agent Eval、Planning、Todo 和受限重规划；保持只读。
+- Phase 2B：Durable Execution 与 Unified Diff / Patch 生成、校验和预览；不得写文件。
+- Phase 2C：Approval、Policy、Capability、Permission Profile、ExecutionBackend 与 Sandbox 分层；通过门禁后只开放项目内受控 `apply_patch`。
+- Phase 2D：Sandbox 内受限 `run_command`、项目既定测试反馈和只读 `git_status`、`git_diff`、`git_log`。
 
-- 写文件、删除文件、Shell、Git、网络工具
-- 写操作、命令或网络访问的审批
-- 永久目录授权、“本次会话全部允许”或真正的 unrestricted full access
-- 远程绑定、登录或多租户部署
-- Planning、Checkpoint、Memory、Skills、Hooks、MCP、Sandbox、Sub-Agent
-- 未经用户当前任务明确确认的真实模型或付费 API Smoke Test
+前一个子里程碑未完成自动验证、evidence 和用户验收时，不得扩大下一层 Tool 或权限。即使未来实施计划已经创建，也必须继续一次只执行一个明确 Task。
 
-只有 Phase 1D 完成条件全部满足并经用户确认后，才进入第二阶段“可控 Coding Agent”。
+Phase 2 禁止提前实现：
+
+- MCP、ACP、A2A、Memory、Skills、Hooks、Sub-Agent。
+- Browser、桌面 GUI、通用 Computer Use、网络 Tool 或包安装。
+- 项目外写入、任意 Shell、系统配置修改或 Git 写操作。
+- `TrustedHostExecutor`、`HOST_FULL_ACCESS` 或其他电脑级完全访问；它们只允许在 Phase 5 第 19 周通过独立安全设计和用户确认门后实施。
+- Token streaming、远程绑定、登录、多租户或生产部署。
+- 未经用户当前任务明确确认的真实模型或付费 API Smoke Test。
+
+Phase 2 的 `PROJECT_FULL_ACCESS` 只表示项目范围内已实现能力可按版本化 Policy 自动执行，仍受硬 Policy 与 Sandbox 限制，不表示可不受限访问终端、互联网或电脑文件。
 
 ## 4. Claude Code 会话角色
 
@@ -85,7 +92,7 @@ Phase 1D 禁止提前实现：
 
 ### 跨对话 Task evidence
 
-实现型 Task 默认使用 `docs/task-evidence/<task-id>.md` 保存跨对话证据，具体格式以 `docs/task-evidence/_template.md` 为准。`task-id` 应稳定且可从当前计划定位，例如 `phase-1d-task-5`。如果当前计划或 `task-spec.md` 已指定其他路径，以明确指定的路径为准。
+实现型 Task 默认使用 `docs/task-evidence/<task-id>.md` 保存跨对话证据，具体格式以 `docs/task-evidence/_template.md` 为准。`task-id` 应稳定且可从当前计划定位，例如未来的 `phase-2a-task-1`。如果当前计划或 `task-spec.md` 已指定其他路径，以明确指定的路径为准。
 
 - `planner`：在计划或 `task-spec.md` 中明确 Task ID、evidence 路径、是否要求 TDD、Red/Green 命令和质量门禁；不把 executor 的运行结果写进 planner 拥有的规范文档。
 - `executor`：在修改生产代码前创建或更新 evidence，记录修改前状态；在命令实际运行时写入 Red、Green、退出码、关键原始输出、质量门禁和范围检查。最终回复只提供摘要和 evidence 链接。
@@ -94,13 +101,14 @@ Phase 1D 禁止提前实现：
 
 缺失的历史 Red 必须标记为 `unavailable`，不得凭记忆补写，也不得在实现完成后临时破坏代码并冒充原始 Red。reviewer 必须分别报告当前实现和 TDD 过程证据；新鲜复验只能证明当前行为，不能独立证明历史 Red→Green 顺序。既有 Task 不要求追溯生成虚假的 evidence。
 
-使用 Claude Code 执行 Phase 1D 时，建议以以下提示开始：
+使用 Claude Code 执行 Phase 2 时，建议以以下提示开始：
 
 ```text
-你是 executor。先完整阅读项目根目录 CLAUDE.md、AGENTS.md、已确认设计文档和 Phase 1D 计划。
-严格按 Phase 1D 的 Task 顺序执行，一次只处理用户当前明确指定的一个 Task，不扩大范围。
+你是 executor。先完整阅读项目根目录 CLAUDE.md、AGENTS.md、Phase 2 权威设计、已确认的 Phase 2 实施计划和当前 Task。
+如果 Phase 2 实施计划或用户明确指定的 Task 不存在，保持等待，不修改任何文件。
+严格按当前子里程碑的 Task 顺序执行，一次只处理用户当前明确指定的一个 Task，不扩大 Tool 或权限范围。
 每个 Task 都要先展示失败测试证据，再实现最小代码，然后运行指定验证。
-未经我明确授权，不要安装依赖、调用真实模型、commit、push、创建 PR，也不要进入第二阶段。
+未经我明确授权，不要安装依赖、调用真实模型、commit、push、创建 PR，也不要进入下一子里程碑或实现 Phase 2 非目标。
 ```
 
 Claude Code 权限与工具行为：
@@ -186,7 +194,7 @@ TDD evidence 规则：
 - 受影响模块通过 mypy strict。
 - `git diff --check` 无空白错误。
 
-Phase 1D 完成前必须运行：
+Phase 1 的完整回归基线为：
 
 ```powershell
 conda run -n agent-foundations python -m pytest -q
@@ -201,7 +209,7 @@ npm run build:chat
 git diff --check
 ```
 
-其中 Chat 前端命令从 Phase 1D Task 10 安装并接入对应依赖后才可执行；在此之前不得为了运行尚不存在的脚本而提前安装依赖或扩大当前 Task。
+Phase 2 每个 Task 运行受影响范围的门禁；每个扩大权限的子里程碑完成前必须重跑上述 Phase 1 完整基线。Phase 2 新增的 Eval、恢复、安全、Sandbox 和前端命令必须由后续实施计划逐项定义；不得为了运行尚不存在的脚本而提前安装依赖或扩大当前 Task。
 
 没有最新命令输出，不得声称“完成”“修复”或“全部通过”。
 

@@ -6,7 +6,7 @@ import pytest
 from agent_foundations.domain.errors import InvalidToolArgumentsError
 from agent_foundations.tools.filesystem.path_policy import PathPolicy
 from agent_foundations.tools.filesystem.search_text import SearchTextTool
-from agent_foundations.tools.registry import ToolRegistry
+from tests.unit.tools.registry_helpers import readonly_tool_registry
 
 FIXTURE_ROOT = Path("tests/fixtures/sample_project").resolve()
 
@@ -43,7 +43,7 @@ async def test_searches_unicode_text_with_casefolding(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_registry_rejects_empty_glob(tmp_path: Path) -> None:
-    registry = ToolRegistry([SearchTextTool(PathPolicy(tmp_path))])
+    registry = readonly_tool_registry(tmp_path)
 
     with pytest.raises(InvalidToolArgumentsError):
         await registry.execute("search_text", {"query": "needle", "glob": ""})

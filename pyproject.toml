@@ -40,6 +40,9 @@ packages = ["src/agent_foundations"]
 addopts = "--strict-markers --strict-config"
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+  "docker: explicitly authorized tests that build or run the Task 14 sandbox image",
+]
 
 [tool.ruff]
 line-length = 100

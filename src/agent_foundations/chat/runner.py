@@ -124,11 +124,12 @@ class ConversationRunner:
             projector = TraceToChatProjector(
                 conversation_id=conversation_id,
                 redactor=redactor,
+                project_root=Path(conversation.project_root),
             )
             event_sink: EventSink = CompositeEventSink(
                 [
                     JsonlEventSink(self._trace_dir, redactor),
-                    ChatProjectionSink(projector, self._broker),
+                    ChatProjectionSink(projector, self._repository, self._broker),
                 ],
             )
             tool_executor = self._tool_executor_factory(conversation, session_id)

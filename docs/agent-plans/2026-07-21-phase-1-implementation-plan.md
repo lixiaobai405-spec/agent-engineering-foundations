@@ -47,9 +47,9 @@ Phase 1A–1C 构成原六周只读 Runtime 计划；Phase 1D 是用户于 2026-
 
 - 设计：[`2026-08-02-phase-1d-interactive-chat-ui-design.md`](2026-08-02-phase-1d-interactive-chat-ui-design.md)
 - 实施：[`2026-08-02-phase-1d-interactive-chat-ui-plan.md`](2026-08-02-phase-1d-interactive-chat-ui-plan.md)
-- 当前 Task 12 实现与 fresh 质量门禁已完成；**Phase 1D implementation completed, awaiting independent review/user acceptance**（evidence: `docs/task-evidence/phase-1d-task-12.md`）。
+- Task 12 实现与 fresh 质量门禁已完成；用户于 2026-08-08 确认第一阶段通过人工验收（evidence: `docs/task-evidence/phase-1d-task-12.md`）。该确认不补造历史测试输出，也不改变 evidence 中已经记录的 TDD 证据结论。
 - Phase 1D 仍只提供 Chat 控制面、SQLite 多轮状态、SSE 活动摘要和一次性项目外精确只读审批。
-- MCP、Memory、Sub-Agent、Shell、Sandbox、写文件和 Token streaming 继续留在 Phase 2–5；**Phase 2 未开始**。
+- MCP、Memory、Sub-Agent、Shell、Sandbox、写文件和 Token streaming 没有回填 Phase 1D；Phase 2 设计与详细实施计划已生成，尚未开始任何实现 Task。权威设计见 [`2026-08-08-phase-2-controllable-coding-agent-design.md`](2026-08-08-phase-2-controllable-coding-agent-design.md)，实施计划见 [`2026-08-08-phase-2-controllable-coding-agent-plan.md`](2026-08-08-phase-2-controllable-coding-agent-plan.md)。
 
 ## 3. 每周节奏
 
@@ -134,7 +134,7 @@ conda run -n agent-foundations python -m mypy src tests
 - 面向最终用户的聊天 Web UI（已由独立 Phase 1D 计划承接，不回填到 1A–1C）
 - Token 成本图、多 Agent 关系图与远程 Viewer
 
-完成上述验收后，还必须完成独立 Phase 1D 的既定 Task 9–12 与总验收，才能进入第二阶段“可控 Coding Agent”，避免提前扩大权限面和复杂度。
+上述验收、独立 Phase 1D 的既定 Task 9–12 与总验收现已完成并由用户于 2026-08-08 确认。Phase 2 权威设计与详细实施计划随后已生成；用户将另行让 planner 为单个 Task 生成执行 prompt，当前状态不构成 executor 自动开始新 Task 的授权。
 
 ## 7. 实施时使用的官方基线
 

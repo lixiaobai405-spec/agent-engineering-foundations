@@ -15,8 +15,11 @@
 ### 本机 Chat + Trace
 
 - `agent-foundations chat`：本机多轮 Chat 控制面，并挂载同一 Trace Viewer。
-- SQLite 持久化 conversation、message、run、approval；SSE 推送活动摘要（非 durable log）。
-- 浏览器访问 `/chat` 进行多轮对话；`/trace?session_id=...` 查看完整 Trace。
+- SQLite 持久化 conversation、message、run、approval 和脱敏后的 tool activity UI 投影；SSE 推送活动摘要（非 durable log）。
+- Chat 对 user/assistant message 渲染安全 GFM（GitHub Flavored Markdown），fenced code 使用 Shiki token 高亮并支持复制原始代码；不渲染 raw HTML、图片或不安全 URL。
+- 每个 run 只显示一个可折叠工具组：active/waiting 默认展开，terminal 默认折叠；这里只保留安全摘要，完整细节仍在 Trace Viewer。
+- 浏览器访问 `/chat` 进行多轮对话；`/trace?conversation_id=...&session_id=...` 精确查看该轮完整 Trace。
+- 早于 tool activity 投影表的历史 run 仍显示对话和 Trace 链接，但可能不显示工具组；系统不会从 JSONL 反向伪造 UI 数据。
 
 ### Runtime 基础
 
@@ -119,7 +122,7 @@ agent-foundations chat --state-db .agent-foundations/chat.sqlite3 --trace-dir tr
 | `--trace-dir` | `traces` | JSONL Trace 目录 |
 | `--port` | `8765`（1024–65535） | 本机 HTTP 端口 |
 
-浏览器打开 `http://127.0.0.1:8765/chat`。页面刷新后通过 HTTP 恢复 latest run 与 pending approval，再连接 SSE；**SSE 不 replay 历史**。
+浏览器打开 `http://127.0.0.1:8765/chat`。页面刷新后通过 HTTP 恢复 messages、runs、tool activities、latest run 与 pending approval，再连接 SSE 并立即做一次 activity catch-up；**SSE 不 replay 历史**。Chat 与 Trace 服务仍只绑定 `127.0.0.1`。
 
 **真实模型**：需在服务端配置 `AGENT_API_KEY`、`AGENT_MODEL`（及可选 `AGENT_BASE_URL`），并单独授权与承担费用。自动测试使用 FakeModel，不调用真实 API。
 

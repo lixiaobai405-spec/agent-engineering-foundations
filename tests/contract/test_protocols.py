@@ -1,3 +1,4 @@
+import importlib.util
 from typing import Any
 
 from agent_foundations.domain.model import ModelProvider, ModelResponse
@@ -33,3 +34,27 @@ def test_tool_implementation_satisfies_tool_protocol() -> None:
 _provider: ModelProvider = FakeModelProvider([ModelResponse(content="ok")])
 
 _tool: Tool = ContractTool()
+
+
+def test_registered_tool_contract_exists() -> None:
+    try:
+        spec = importlib.util.find_spec("agent_foundations.security.models")
+    except ModuleNotFoundError:
+        spec = None
+    assert spec is not None, "agent_foundations.security.models is not implemented"
+    from agent_foundations.domain.tool import RegisteredTool
+    from agent_foundations.security.models import SideEffectKind, ToolManifest
+    from agent_foundations.security.resources import resolve_contract_resource
+
+    registered = RegisteredTool(
+        ContractTool(),
+        ToolManifest(
+            name="contract",
+            resource_kind="project_path",
+            operations=("read",),
+            side_effect=SideEffectKind.NONE,
+            sandbox_required=False,
+        ),
+        resolve_contract_resource,
+    )
+    assert registered.tool.name == registered.manifest.name

@@ -14,6 +14,12 @@ export type ApprovalStatus = "pending" | "approved" | "denied" | "invalidated";
 
 export type ApprovalDecision = "approve" | "deny";
 
+export type ToolActivityStatus =
+  | "running"
+  | "completed"
+  | "failed"
+  | "interrupted";
+
 export type ChatEventType =
   | "run.started"
   | "model.requested"
@@ -90,6 +96,19 @@ export interface ChatEvent {
   type: ChatEventType;
   occurred_at: string;
   data: Record<string, unknown>;
+}
+
+export interface ChatToolActivity {
+  conversation_id: string;
+  session_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  status: ToolActivityStatus;
+  arguments_summary: string | null;
+  result_summary: string | null;
+  started_at: string;
+  finished_at: string | null;
+  last_event_id: string;
 }
 
 export interface ActiveApproval {

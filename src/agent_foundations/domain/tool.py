@@ -1,5 +1,5 @@
-from collections.abc import Mapping
-from typing import Annotated, Any, Protocol, runtime_checkable
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, Annotated, Any, NamedTuple, Protocol, runtime_checkable
 
 from pydantic import (
     ConfigDict,
@@ -15,6 +15,19 @@ from agent_foundations.domain._freeze import (
     _validate_freeze_dict,
 )
 from agent_foundations.domain._model import ValidatedCopyModel
+
+if TYPE_CHECKING:
+    from agent_foundations.security.models import PolicyResource, ToolManifest
+
+    ToolResourceResolver = Callable[[Mapping[str, Any]], PolicyResource]
+else:
+    ToolResourceResolver = Callable[[Mapping[str, Any]], Any]
+
+
+class RegisteredTool(NamedTuple):
+    tool: "Tool"
+    manifest: "ToolManifest"
+    resource_resolver: ToolResourceResolver
 
 
 class ToolCall(ValidatedCopyModel):

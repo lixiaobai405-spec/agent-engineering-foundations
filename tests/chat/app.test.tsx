@@ -7,11 +7,13 @@ import * as api from "../../web/chat/state/api";
 import type {
   ChatEvent,
   ChatMessage,
+  ChatToolActivity,
   Conversation,
   RunRecord,
 } from "../../web/chat/state/types";
 
-const { listRunsMock } = vi.hoisted(() => ({
+const { listActivitiesMock, listRunsMock } = vi.hoisted(() => ({
+  listActivitiesMock: vi.fn(),
   listRunsMock: vi.fn(),
 }));
 
@@ -27,6 +29,7 @@ vi.mock("../../web/chat/state/api", async () => {
     patchConversation: vi.fn(),
     listMessages: vi.fn(),
     listRuns: listRunsMock,
+    listActivities: listActivitiesMock,
     postMessage: vi.fn(),
     getRun: vi.fn(),
     getConversationState: vi.fn(),
@@ -143,6 +146,7 @@ beforeEach(() => {
   );
   window.localStorage.clear();
   vi.mocked(api.listConversations).mockResolvedValue([]);
+  listActivitiesMock.mockResolvedValue([]);
   vi.mocked(api.getConversation).mockImplementation(async (conversationId) => {
     if (conversationId === CONVERSATION_A.conversation_id) {
       return CONVERSATION_A;
@@ -235,6 +239,10 @@ describe("App", () => {
       callOrder.push(`listRuns:${conversationId}`);
       return [];
     });
+    listActivitiesMock.mockImplementation(async (conversationId: string) => {
+      callOrder.push(`listActivities:${conversationId}`);
+      return [];
+    });
     vi.mocked(api.getConversationState).mockImplementation(async (conversationId) => {
       callOrder.push(`getConversationState:${conversationId}`);
       return { latest_run: null, pending_approval: null };
@@ -253,7 +261,9 @@ describe("App", () => {
         `getConversation:${CONVERSATION_A.conversation_id}`,
         `listMessages:${CONVERSATION_A.conversation_id}`,
         `listRuns:${CONVERSATION_A.conversation_id}`,
+        `listActivities:${CONVERSATION_A.conversation_id}`,
         `getConversationState:${CONVERSATION_A.conversation_id}`,
+        `listActivities:${CONVERSATION_A.conversation_id}`,
       ]);
     });
 
@@ -270,7 +280,9 @@ describe("App", () => {
       `getConversation:${CONVERSATION_B.conversation_id}`,
       `listMessages:${CONVERSATION_B.conversation_id}`,
       `listRuns:${CONVERSATION_B.conversation_id}`,
+      `listActivities:${CONVERSATION_B.conversation_id}`,
       `getConversationState:${CONVERSATION_B.conversation_id}`,
+      `listActivities:${CONVERSATION_B.conversation_id}`,
     ]);
     expect(latestEventSource().closed).toBe(false);
   });
@@ -315,6 +327,40 @@ describe("App", () => {
     expect(screen.queryByText("optimistic assistant")).not.toBeInTheDocument();
   });
 
+  it("loads the posted run so live tool activity is expanded while the run is active", async () => {
+    const user = userEvent.setup();
+    const runningRun: RunRecord = {
+      session_id: "33333333-3333-4333-8333-333333333333",
+      conversation_id: CONVERSATION_A.conversation_id,
+      user_message_id: MESSAGE_USER.message_id,
+      trace_path: "traces/session-new.jsonl",
+      assistant_message_id: null,
+      status: "running",
+      error_code: null,
+      created_at: "2026-08-02T00:00:00Z",
+      started_at: "2026-08-02T00:00:01Z",
+      finished_at: null,
+    };
+    vi.mocked(api.listConversations).mockResolvedValue([CONVERSATION_A]);
+    vi.mocked(api.postMessage).mockResolvedValue({ session_id: runningRun.session_id });
+    vi.mocked(api.listMessages).mockResolvedValue([MESSAGE_USER]);
+    listRunsMock.mockResolvedValueOnce([]).mockResolvedValue([runningRun]);
+
+    render(<App />);
+    await user.type(await screen.findByLabelText("Message"), "inspect");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(listRunsMock).toHaveBeenCalledTimes(2));
+    latestEventSource().emit("tool.requested", {
+      tool_call_id: "call-live",
+      name: "read_file",
+      arguments_summary: "README.md",
+    });
+
+    expect(
+      await screen.findByRole("button", { name: /1 tool activity/i }),
+    ).toHaveAttribute("aria-expanded", "true");
+  });
+
   it("adds the assistant message only after SSE or HTTP reload", async () => {
     const user = userEvent.setup();
     vi.mocked(api.listConversations).mockResolvedValue([CONVERSATION_A]);
@@ -354,13 +400,68 @@ describe("App", () => {
     vi.mocked(api.listMessages).mockResolvedValue([
       {
         ...MESSAGE_USER,
-        content: "<script>alert(1)</script>",
+        content: "safe text\n\n<script>alert(1)</script>",
       },
     ]);
 
     render(<App />);
-    expect(await screen.findByText("<script>alert(1)</script>")).toBeInTheDocument();
+    expect(await screen.findByText("safe text")).toBeInTheDocument();
     expect(document.querySelector("script")).toBeNull();
+  });
+
+  it("renders a message-centric turn with Markdown, grouped tools, and exact Trace link", async () => {
+    const user = userEvent.setup();
+    const userMessage = { ...MESSAGE_USER, content: "# Inspect project" };
+    const assistantMessage: ChatMessage = {
+      ...MESSAGE_USER,
+      message_id: "bbbb0000-0000-4000-8000-000000000002",
+      role: "assistant",
+      content: "| file | result |\n| - | - |\n| README.md | found |",
+      sequence: 2,
+    };
+    const completedRun: RunRecord = {
+      session_id: "session-structured",
+      conversation_id: CONVERSATION_A.conversation_id,
+      user_message_id: userMessage.message_id,
+      trace_path: "traces/session-structured.jsonl",
+      assistant_message_id: assistantMessage.message_id,
+      status: "completed",
+      error_code: null,
+      created_at: "2026-08-02T00:00:00Z",
+      started_at: "2026-08-02T00:00:01Z",
+      finished_at: "2026-08-02T00:00:02Z",
+    };
+    const activity: ChatToolActivity = {
+      conversation_id: CONVERSATION_A.conversation_id,
+      session_id: completedRun.session_id,
+      tool_call_id: "call-structured",
+      tool_name: "read_file",
+      status: "completed",
+      arguments_summary: "README.md",
+      result_summary: "12 lines",
+      started_at: "2026-08-02T00:00:01Z",
+      finished_at: "2026-08-02T00:00:02Z",
+      last_event_id: "event-structured",
+    };
+    vi.mocked(api.listConversations).mockResolvedValue([CONVERSATION_A]);
+    vi.mocked(api.listMessages).mockResolvedValue([userMessage, assistantMessage]);
+    listRunsMock.mockResolvedValue([completedRun]);
+    listActivitiesMock.mockResolvedValue([activity]);
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Inspect project" })).toBeInTheDocument();
+    expect(screen.getByRole("table")).toBeInTheDocument();
+    const activityToggle = screen.getByRole("button", { name: /1 tool activity/i });
+    expect(activityToggle).toHaveAttribute("aria-expanded", "false");
+    await user.click(activityToggle);
+    expect(screen.getByText("read_file")).toBeInTheDocument();
+    expect(screen.getByText("12 lines")).toBeInTheDocument();
+    expect(screen.queryByText(/event-structured/)).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Open trace for this turn" })).toHaveAttribute(
+      "href",
+      `/trace?conversation_id=${CONVERSATION_A.conversation_id}&session_id=session-structured`,
+    );
   });
 
   it("handles approval decisions with local disable and server conflict", async () => {
@@ -514,6 +615,10 @@ describe("App", () => {
       callOrder.push(`listRuns:${conversationId}`);
       return [];
     });
+    listActivitiesMock.mockImplementation(async (conversationId: string) => {
+      callOrder.push(`listActivities:${conversationId}`);
+      return [];
+    });
     vi.mocked(api.getConversationState).mockImplementation(async (conversationId) => {
       callOrder.push(`getConversationState:${conversationId}`);
       return { latest_run: null, pending_approval: null };
@@ -527,8 +632,42 @@ describe("App", () => {
       `getConversation:${CONVERSATION_A.conversation_id}`,
       `listMessages:${CONVERSATION_A.conversation_id}`,
       `listRuns:${CONVERSATION_A.conversation_id}`,
+      `listActivities:${CONVERSATION_A.conversation_id}`,
       `getConversationState:${CONVERSATION_A.conversation_id}`,
+      `listActivities:${CONVERSATION_A.conversation_id}`,
     ]);
+  });
+
+  it("keeps messages usable when activity recovery fails and retries only activity", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.listConversations).mockResolvedValue([CONVERSATION_A]);
+    vi.mocked(api.listMessages).mockResolvedValue([MESSAGE_USER]);
+    listActivitiesMock
+      .mockRejectedValueOnce(new api.ChatApiError(503, "activity unavailable"))
+      .mockRejectedValueOnce(new api.ChatApiError(503, "activity unavailable"))
+      .mockResolvedValue([]);
+
+    render(<App />);
+
+    expect(await screen.findByText("hello")).toBeInTheDocument();
+    const retry = await screen.findByRole("button", { name: "Retry activity" });
+    expect(MockEventSource.instances).toHaveLength(1);
+    const messagesCalls = vi.mocked(api.listMessages).mock.calls.length;
+    await user.click(retry);
+    await waitFor(() => expect(listActivitiesMock).toHaveBeenCalledTimes(3));
+    expect(vi.mocked(api.listMessages)).toHaveBeenCalledTimes(messagesCalls);
+    expect(screen.queryByRole("button", { name: "Retry activity" })).not.toBeInTheDocument();
+  });
+
+  it("refetches activities after terminal SSE events", async () => {
+    vi.mocked(api.listConversations).mockResolvedValue([CONVERSATION_A]);
+    vi.mocked(api.listMessages).mockResolvedValue([MESSAGE_USER]);
+
+    render(<App />);
+    await waitFor(() => expect(MockEventSource.instances).toHaveLength(1));
+    await waitFor(() => expect(listActivitiesMock).toHaveBeenCalledTimes(2));
+    latestEventSource().emit("run.completed", { status: "completed" });
+    await waitFor(() => expect(listActivitiesMock).toHaveBeenCalledTimes(3));
   });
 
   it("disables composer and permission mode for recovered running state", async () => {

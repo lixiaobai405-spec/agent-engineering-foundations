@@ -1,0 +1,324 @@
+{
+  "schema_version": 1,
+  "fixture_id": "phase-1-responses",
+  "fixture_version": "phase-2a-v1",
+  "scripts": [
+    {
+      "task_id": "phase1-code-location",
+      "responses": [
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-locate-1",
+              "name": "search_text",
+              "arguments": {"query": "authenticate", "path": "."}
+            }
+          ],
+          "usage": {"input_tokens": 12, "output_tokens": 8}
+        },
+        {
+          "content": "The authenticate function is defined in src/auth.py.",
+          "tool_calls": [],
+          "usage": {"input_tokens": 24, "output_tokens": 12}
+        }
+      ]
+    },
+    {
+      "task_id": "phase1-error-explanation",
+      "responses": [
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-read-auth-1",
+              "name": "read_file",
+              "arguments": {"path": "src/auth.py"}
+            }
+          ],
+          "usage": {"input_tokens": 10, "output_tokens": 6}
+        },
+        {
+          "content": "authenticate returns False when the token is not demo-token.",
+          "tool_calls": [],
+          "usage": {"input_tokens": 18, "output_tokens": 10}
+        }
+      ]
+    },
+    {
+      "task_id": "phase1-readonly-tool-selection",
+      "responses": [
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-list-src-1",
+              "name": "list_directory",
+              "arguments": {"path": "src"}
+            }
+          ],
+          "usage": {"input_tokens": 9, "output_tokens": 5}
+        },
+        {
+          "content": "The src directory contains auth.py.",
+          "tool_calls": [],
+          "usage": {"input_tokens": 14, "output_tokens": 8}
+        }
+      ]
+    },
+    {
+      "task_id": "phase1-sensitive-file-rejection",
+      "responses": [
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-read-env-1",
+              "name": "read_file",
+              "arguments": {"path": ".env"}
+            }
+          ],
+          "usage": {"input_tokens": 8, "output_tokens": 4}
+        },
+        {
+          "content": "Reading .env is blocked by project path policy.",
+          "tool_calls": [],
+          "usage": {"input_tokens": 12, "output_tokens": 6}
+        }
+      ]
+    },
+    {
+      "task_id": "phase1-external-path-rejection",
+      "responses": [
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-read-external-1",
+              "name": "read_file",
+              "arguments": {"path": "C:/outside/eval-forbidden.txt"}
+            }
+          ],
+          "usage": {"input_tokens": 8, "output_tokens": 4}
+        },
+        {
+          "content": "Absolute paths outside the project are blocked by path policy.",
+          "tool_calls": [],
+          "usage": {"input_tokens": 12, "output_tokens": 6}
+        }
+      ]
+    },
+    {
+      "task_id": "phase2a-planning-required",
+      "responses": [
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-set-plan-1",
+              "name": "set_plan",
+              "arguments": {
+                "goal": "Locate authenticate in the codebase",
+                "steps": [
+                  {
+                    "step_id": "search",
+                    "description": "Search for authenticate definition"
+                  }
+                ]
+              }
+            }
+          ],
+          "usage": {"input_tokens": 14, "output_tokens": 10}
+        },
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-upd-inprog-1",
+              "name": "update_plan_step",
+              "arguments": {
+                "plan_version": 1,
+                "step_id": "search",
+                "status": "in_progress"
+              }
+            }
+          ],
+          "usage": {"input_tokens": 10, "output_tokens": 6}
+        },
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-search-plan-1",
+              "name": "search_text",
+              "arguments": {"query": "authenticate", "path": "."}
+            }
+          ],
+          "usage": {"input_tokens": 12, "output_tokens": 8}
+        },
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-upd-done-1",
+              "name": "update_plan_step",
+              "arguments": {
+                "plan_version": 2,
+                "step_id": "search",
+                "status": "completed",
+                "evidence_tool_call_ids": ["call-search-plan-1"]
+              }
+            }
+          ],
+          "usage": {"input_tokens": 10, "output_tokens": 6}
+        },
+        {
+          "content": "authenticate is defined in src/auth.py.",
+          "tool_calls": [],
+          "usage": {"input_tokens": 16, "output_tokens": 10}
+        }
+      ]
+    },
+    {
+      "task_id": "phase2a-planning-disabled",
+      "responses": [
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-list-disabled-1",
+              "name": "list_directory",
+              "arguments": {"path": "src"}
+            }
+          ],
+          "usage": {"input_tokens": 9, "output_tokens": 5}
+        },
+        {
+          "content": "The src directory contains auth.py.",
+          "tool_calls": [],
+          "usage": {"input_tokens": 14, "output_tokens": 8}
+        }
+      ]
+    },
+    {
+      "task_id": "phase2a-replan-limit",
+      "responses": [
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-set-replan-1",
+              "name": "set_plan",
+              "arguments": {
+                "goal": "List src directory with bounded replans",
+                "steps": [
+                  {"step_id": "a", "description": "initial step a"},
+                  {"step_id": "b", "description": "initial step b", "depends_on": ["a"]}
+                ]
+              }
+            }
+          ],
+          "usage": {"input_tokens": 12, "output_tokens": 8}
+        },
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-replan-1",
+              "name": "replan",
+              "arguments": {
+                "plan_version": 1,
+                "reason": "first replan",
+                "replacement_pending_steps": [
+                  {"step_id": "c", "description": "replacement c"}
+                ]
+              }
+            }
+          ],
+          "usage": {"input_tokens": 10, "output_tokens": 6}
+        },
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-replan-2",
+              "name": "replan",
+              "arguments": {
+                "plan_version": 2,
+                "reason": "second replan",
+                "replacement_pending_steps": [
+                  {"step_id": "d", "description": "replacement d"}
+                ]
+              }
+            }
+          ],
+          "usage": {"input_tokens": 10, "output_tokens": 6}
+        },
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-replan-3",
+              "name": "replan",
+              "arguments": {
+                "plan_version": 3,
+                "reason": "third replan should fail",
+                "replacement_pending_steps": [
+                  {"step_id": "e", "description": "replacement e"}
+                ]
+              }
+            }
+          ],
+          "usage": {"input_tokens": 10, "output_tokens": 6}
+        },
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-upd-d-inprog",
+              "name": "update_plan_step",
+              "arguments": {
+                "plan_version": 3,
+                "step_id": "d",
+                "status": "in_progress"
+              }
+            }
+          ],
+          "usage": {"input_tokens": 10, "output_tokens": 6}
+        },
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-list-replan-1",
+              "name": "list_directory",
+              "arguments": {"path": "src"}
+            }
+          ],
+          "usage": {"input_tokens": 9, "output_tokens": 5}
+        },
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-upd-d-done",
+              "name": "update_plan_step",
+              "arguments": {
+                "plan_version": 4,
+                "step_id": "d",
+                "status": "completed",
+                "evidence_tool_call_ids": ["call-list-replan-1"]
+              }
+            }
+          ],
+          "usage": {"input_tokens": 10, "output_tokens": 6}
+        },
+        {
+          "content": "Listed src; auth.py is present.",
+          "tool_calls": [],
+          "usage": {"input_tokens": 14, "output_tokens": 8}
+        }
+      ]
+    }
+  ]
+}

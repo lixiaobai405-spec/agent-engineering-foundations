@@ -21,6 +21,7 @@ from agent_foundations.chat.models import (
     ApprovalStatus,
     ChatEvent,
     ChatMessage,
+    ChatToolActivity,
     Conversation,
     PermissionMode,
     RunRecord,
@@ -215,6 +216,18 @@ def create_chat_router(
     async def list_runs(conversation_id: UUID) -> list[RunRecord]:
         try:
             return await repository.list_runs(str(conversation_id))
+        except ChatNotFoundError as exc:
+            raise _stable_http_error(exc) from exc
+
+    @router.get(
+        "/conversations/{conversation_id}/activities",
+        response_model=list[ChatToolActivity],
+    )
+    async def list_tool_activities(
+        conversation_id: UUID,
+    ) -> list[ChatToolActivity]:
+        try:
+            return await repository.list_tool_activities(str(conversation_id))
         except ChatNotFoundError as exc:
             raise _stable_http_error(exc) from exc
 

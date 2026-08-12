@@ -1807,7 +1807,7 @@ README must clearly separate:
 
 - [x] **Step 5: 更新计划状态但不得提前勾选**
 
-Evidence: [`docs/task-evidence/phase-1d-task-12.md`](../../task-evidence/phase-1d-task-12.md). Phase 1D implementation completed, awaiting independent review/user acceptance. Phase 2 not started.
+Evidence: [`docs/task-evidence/phase-1d-task-12.md`](../../task-evidence/phase-1d-task-12.md). Phase 1D implementation and fresh gates completed; the user confirmed Phase 1 manual acceptance on 2026-08-08. This status update does not manufacture missing historical evidence. Phase 2 design and implementation planning are complete; no implementation Task has started.
 
 - [x] **Step 6: 运行完整新鲜质量门禁**
 
@@ -1827,9 +1827,9 @@ git status --short
 
 Expected: every command exits `0`; report exact pass counts from this run. `git status` may still include preserved Phase 1B/1C user changes, which must be identified rather than removed.
 
-- [ ] **Step 7: 人工安全验收**
+- [x] **Step 7: 人工安全验收**
 
-Automated E2E does not substitute independent manual smoke. Awaiting reviewer/user completion (see `docs/task-evidence/phase-1d-task-12.md` remediation checklist).
+Automated E2E does not substitute independent manual smoke. The user explicitly confirmed on 2026-08-08 that Phase 1 passed manual acceptance. No unrecorded command, output, or historical Red evidence is inferred from that confirmation.
 
 - [ ] **Step 8: 检查最终范围并等待 commit/push 授权**
 
@@ -1874,7 +1874,7 @@ Do not push or create a PR without a new explicit confirmation.
 - [x] Python、Viewer、Chat、E2E 和依赖门禁均有最新通过证据（见 `docs/task-evidence/phase-1d-task-12.md`）。
 - [x] README、学习笔记、阶段文档与实现边界一致。
 
-**Note:** Checkboxes reflect executor fresh gate evidence only. Phase 1D **not** user-accepted; Phase 2 **not** started.
+**Note:** Executor fresh gate evidence remains in `docs/task-evidence/phase-1d-task-12.md`; the user separately confirmed Phase 1D manual acceptance on 2026-08-08. Phase 2 design and implementation planning are complete; no implementation Task has started.
 
 ## 实施时参考的官方资料
 

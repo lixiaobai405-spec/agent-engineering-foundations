@@ -13,14 +13,18 @@ from agent_foundations.chat.models import (
     ApprovalRequest,
     ApprovalStatus,
     ChatMessage,
+    ChatToolActivity,
     Conversation,
     MessageRole,
     PermissionMode,
     RunRecord,
     RunStatus,
+    ToolActivityStatus,
     new_id,
     utc_now,
 )
+from agent_foundations.storage.database import FutureSchemaVersionError, SqliteDatabase
+from agent_foundations.storage.migrations import get_application_migrations
 
 _RUN_TRANSITIONS: dict[RunStatus, set[RunStatus]] = {
     RunStatus.QUEUED: {RunStatus.RUNNING, RunStatus.FAILED, RunStatus.INTERRUPTED},
@@ -46,74 +50,9 @@ _TERMINAL_RUN_STATUSES = {
     RunStatus.INTERRUPTED,
 }
 
-_SCHEMA_VERSION = 1
 
-_SCHEMA_SQL = """
-CREATE TABLE conversations (
-  conversation_id TEXT PRIMARY KEY,
-  title TEXT NOT NULL CHECK(length(trim(title)) BETWEEN 1 AND 120),
-  project_root TEXT NOT NULL,
-  permission_mode TEXT NOT NULL CHECK(
-    permission_mode IN ('PROJECT_READ_ONLY','ASK_FOR_ACCESS')
-  ),
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-CREATE TABLE messages (
-  message_id TEXT PRIMARY KEY,
-  conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
-  role TEXT NOT NULL CHECK(role IN ('user','assistant')),
-  content TEXT NOT NULL CHECK(length(content) > 0),
-  sequence INTEGER NOT NULL CHECK(sequence >= 1),
-  created_at TEXT NOT NULL,
-  UNIQUE(conversation_id, sequence)
-);
-CREATE TABLE runs (
-  session_id TEXT PRIMARY KEY,
-  conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
-  user_message_id TEXT NOT NULL REFERENCES messages(message_id),
-  assistant_message_id TEXT REFERENCES messages(message_id),
-  trace_path TEXT NOT NULL CHECK(length(trim(trace_path)) > 0),
-  status TEXT NOT NULL CHECK(
-    status IN (
-      'queued',
-      'running',
-      'waiting_approval',
-      'completed',
-      'failed',
-      'interrupted'
-    )
-  ),
-  error_code TEXT,
-  created_at TEXT NOT NULL,
-  started_at TEXT,
-  finished_at TEXT
-);
-CREATE UNIQUE INDEX one_active_run_per_conversation
-ON runs(conversation_id)
-WHERE status IN ('queued','running','waiting_approval');
-CREATE TABLE approval_requests (
-  approval_id TEXT PRIMARY KEY,
-  conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
-  session_id TEXT NOT NULL REFERENCES runs(session_id),
-  tool_call_id TEXT NOT NULL,
-  tool_name TEXT NOT NULL,
-  canonical_path TEXT NOT NULL,
-  operation TEXT NOT NULL CHECK(operation = 'read'),
-  status TEXT NOT NULL CHECK(
-    status IN ('pending','approved','denied','invalidated')
-  ),
-  requested_at TEXT NOT NULL,
-  decided_at TEXT,
-  UNIQUE(session_id, tool_call_id)
-);
-"""
-
-_SCHEMA_STATEMENTS = tuple(
-    statement.strip()
-    for statement in _SCHEMA_SQL.split(";")
-    if statement.strip()
-)
+class UnsupportedSchemaVersionError(ChatError):
+    """Raised when the on-disk schema is newer than this repository supports."""
 
 
 def _assert_permission_mode_change_allowed(
@@ -148,16 +87,19 @@ def _assert_permission_mode_change_allowed(
         )
 
 
-class UnsupportedSchemaVersionError(ChatError):
-    """Raised when the on-disk schema is newer than this repository supports."""
-
-
 class ConversationRepository:
     def __init__(self, database_path: Path) -> None:
         self._database_path = database_path.resolve()
+        self._database = SqliteDatabase(
+            self._database_path,
+            get_application_migrations(),
+        )
 
     async def initialize(self) -> None:
-        await asyncio.to_thread(self._initialize_sync)
+        try:
+            await self._database.initialize()
+        except FutureSchemaVersionError as exc:
+            raise UnsupportedSchemaVersionError(str(exc)) from exc
 
     async def create_conversation(
         self,
@@ -212,6 +154,21 @@ class ConversationRepository:
 
     async def list_runs(self, conversation_id: str) -> list[RunRecord]:
         return await asyncio.to_thread(self._list_runs_sync, conversation_id)
+
+    async def upsert_tool_activity(
+        self,
+        activity: ChatToolActivity,
+    ) -> ChatToolActivity:
+        return await asyncio.to_thread(self._upsert_tool_activity_sync, activity)
+
+    async def list_tool_activities(
+        self,
+        conversation_id: str,
+    ) -> list[ChatToolActivity]:
+        return await asyncio.to_thread(
+            self._list_tool_activities_sync,
+            conversation_id,
+        )
 
     async def list_messages(self, conversation_id: str) -> list[ChatMessage]:
         return await asyncio.to_thread(self._list_messages_sync, conversation_id)
@@ -303,34 +260,8 @@ class ConversationRepository:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self._database_path, timeout=5.0)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 5000")
-        try:
+        with self._database.connect() as connection:
             yield connection
-        finally:
-            connection.close()
-
-    def _initialize_sync(self) -> None:
-        self._database_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
-            version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version > _SCHEMA_VERSION:
-                raise UnsupportedSchemaVersionError(
-                    f"unsupported schema version: {version}",
-                )
-            if version == _SCHEMA_VERSION:
-                return
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                for statement in _SCHEMA_STATEMENTS:
-                    connection.execute(statement)
-                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-                connection.commit()
-            except sqlite3.Error:
-                connection.rollback()
-                raise
 
     def _create_conversation_sync(
         self,
@@ -627,6 +558,108 @@ class ConversationRepository:
                 (conversation_id,),
             ).fetchall()
         return [_row_to_run(row) for row in rows]
+
+    def _upsert_tool_activity_sync(
+        self,
+        activity: ChatToolActivity,
+    ) -> ChatToolActivity:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                run_row = connection.execute(
+                    "SELECT conversation_id FROM runs WHERE session_id = ?",
+                    (activity.session_id,),
+                ).fetchone()
+                if run_row is None:
+                    raise ChatNotFoundError(f"run not found: {activity.session_id}")
+                if run_row["conversation_id"] != activity.conversation_id:
+                    raise ChatConflictError("activity conversation mismatch")
+
+                existing_row = connection.execute(
+                    """
+                    SELECT r.conversation_id, a.*
+                    FROM chat_tool_activities AS a
+                    JOIN runs AS r ON r.session_id = a.session_id
+                    WHERE a.session_id = ? AND a.tool_call_id = ?
+                    """,
+                    (activity.session_id, activity.tool_call_id),
+                ).fetchone()
+                if existing_row is None:
+                    merged = activity
+                    connection.execute(
+                        """
+                        INSERT INTO chat_tool_activities (
+                            session_id,
+                            tool_call_id,
+                            tool_name,
+                            status,
+                            arguments_summary,
+                            result_summary,
+                            started_at,
+                            finished_at,
+                            last_event_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        _activity_values(merged),
+                    )
+                else:
+                    current = _row_to_tool_activity(existing_row)
+                    merged = _merge_tool_activity(current, activity)
+                    if merged != current:
+                        connection.execute(
+                            """
+                            UPDATE chat_tool_activities
+                            SET
+                                tool_name = ?,
+                                status = ?,
+                                arguments_summary = ?,
+                                result_summary = ?,
+                                finished_at = ?,
+                                last_event_id = ?
+                            WHERE session_id = ? AND tool_call_id = ?
+                            """,
+                            (
+                                merged.tool_name,
+                                merged.status.value,
+                                merged.arguments_summary,
+                                merged.result_summary,
+                                _serialize_optional_datetime(merged.finished_at),
+                                merged.last_event_id,
+                                merged.session_id,
+                                merged.tool_call_id,
+                            ),
+                        )
+                connection.commit()
+            except (ChatNotFoundError, ChatConflictError):
+                connection.rollback()
+                raise
+            except sqlite3.Error:
+                connection.rollback()
+                raise
+        return merged
+
+    def _list_tool_activities_sync(
+        self,
+        conversation_id: str,
+    ) -> list[ChatToolActivity]:
+        with self._connect() as connection:
+            conversation = connection.execute(
+                "SELECT 1 FROM conversations WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if conversation is None:
+                raise ChatNotFoundError(f"conversation not found: {conversation_id}")
+            rows = connection.execute(
+                """
+                SELECT r.conversation_id, a.*
+                FROM chat_tool_activities AS a
+                JOIN runs AS r ON r.session_id = a.session_id
+                WHERE r.conversation_id = ?
+                ORDER BY r.created_at, a.started_at, a.tool_call_id
+                """,
+                (conversation_id,),
+            ).fetchall()
+        return [_row_to_tool_activity(row) for row in rows]
 
     def _get_conversation_state_sync(
         self,
@@ -1233,6 +1266,24 @@ class ConversationRepository:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                connection.execute(
+                    f"""
+                    UPDATE chat_tool_activities
+                    SET status = ?, finished_at = COALESCE(finished_at, ?)
+                    WHERE status = ?
+                      AND session_id IN (
+                          SELECT session_id
+                          FROM runs
+                          WHERE status IN ({placeholders})
+                      )
+                    """,
+                    (
+                        ToolActivityStatus.INTERRUPTED.value,
+                        now_text,
+                        ToolActivityStatus.RUNNING.value,
+                        *active_statuses,
+                    ),
+                )
                 interrupted_runs = connection.execute(
                     f"""
                     UPDATE runs
@@ -1319,6 +1370,47 @@ def _serialize_optional_datetime(value: datetime | None) -> str | None:
     return _serialize_datetime(value)
 
 
+def _activity_values(activity: ChatToolActivity) -> tuple[object, ...]:
+    return (
+        activity.session_id,
+        activity.tool_call_id,
+        activity.tool_name,
+        activity.status.value,
+        activity.arguments_summary,
+        activity.result_summary,
+        _serialize_datetime(activity.started_at),
+        _serialize_optional_datetime(activity.finished_at),
+        activity.last_event_id,
+    )
+
+
+def _merge_tool_activity(
+    current: ChatToolActivity,
+    incoming: ChatToolActivity,
+) -> ChatToolActivity:
+    if current.tool_name != incoming.tool_name:
+        raise ChatConflictError("activity tool mismatch")
+    if current.status in ToolActivityStatus.terminal():
+        return current
+    return current.model_copy(
+        update={
+            "status": incoming.status,
+            "arguments_summary": (
+                incoming.arguments_summary
+                if incoming.arguments_summary is not None
+                else current.arguments_summary
+            ),
+            "result_summary": (
+                incoming.result_summary
+                if incoming.result_summary is not None
+                else current.result_summary
+            ),
+            "finished_at": incoming.finished_at,
+            "last_event_id": incoming.last_event_id,
+        },
+    )
+
+
 def _normalize_title(title: str) -> str:
     stripped = title.strip()
     if not stripped:
@@ -1400,4 +1492,23 @@ def _row_to_approval(row: sqlite3.Row) -> ApprovalRequest:
             if row["decided_at"] is not None
             else None
         ),
+    )
+
+
+def _row_to_tool_activity(row: sqlite3.Row) -> ChatToolActivity:
+    return ChatToolActivity(
+        conversation_id=row["conversation_id"],
+        session_id=row["session_id"],
+        tool_call_id=row["tool_call_id"],
+        tool_name=row["tool_name"],
+        status=ToolActivityStatus(row["status"]),
+        arguments_summary=row["arguments_summary"],
+        result_summary=row["result_summary"],
+        started_at=_deserialize_datetime(row["started_at"]),
+        finished_at=(
+            _deserialize_datetime(row["finished_at"])
+            if row["finished_at"] is not None
+            else None
+        ),
+        last_event_id=row["last_event_id"],
     )

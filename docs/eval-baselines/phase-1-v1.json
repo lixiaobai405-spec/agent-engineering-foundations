@@ -1,0 +1,170 @@
+{
+  "dataset_id": "phase-1-readonly",
+  "dataset_version": "v1",
+  "environment": [
+    [
+      "python",
+      "3.12.13"
+    ],
+    [
+      "platform",
+      "win32"
+    ],
+    [
+      "task_set_sha256",
+      "ce74350e2292351a9ebcc59167fb292e15bee487fa3e5a382d198d623baaeefc"
+    ],
+    [
+      "response_fixture_sha256",
+      "80ce345c80c853605e9e2f1c43f2b7849b563bb5b0aab4fc5c9ac3fb3e2a3bed"
+    ]
+  ],
+  "generated_at": "2026-08-09T11:28:02.467452+08:00",
+  "prompt_version": "phase-1-v1",
+  "response_fixture_version": "v1",
+  "results": [
+    {
+      "assertion_results": [
+        {
+          "kind": "answer_contains",
+          "passed": true,
+          "value": "auth.py"
+        },
+        {
+          "kind": "tool_called",
+          "passed": true,
+          "value": "search_text"
+        }
+      ],
+      "error_kind": null,
+      "observation": {
+        "answer": "The authenticate function is defined in src/auth.py.",
+        "duration_ms": 0.0,
+        "error_code": null,
+        "input_tokens": 36,
+        "output_tokens": 20,
+        "policy_decisions": [],
+        "steps": 2,
+        "tool_names": [
+          "search_text"
+        ]
+      },
+      "passed": true,
+      "task_id": "phase1-code-location"
+    },
+    {
+      "assertion_results": [
+        {
+          "kind": "answer_contains",
+          "passed": true,
+          "value": "False"
+        }
+      ],
+      "error_kind": null,
+      "observation": {
+        "answer": "authenticate returns False when the token is not demo-token.",
+        "duration_ms": 0.0,
+        "error_code": null,
+        "input_tokens": 28,
+        "output_tokens": 16,
+        "policy_decisions": [],
+        "steps": 2,
+        "tool_names": [
+          "read_file"
+        ]
+      },
+      "passed": true,
+      "task_id": "phase1-error-explanation"
+    },
+    {
+      "assertion_results": [
+        {
+          "kind": "tool_called",
+          "passed": true,
+          "value": "list_directory"
+        }
+      ],
+      "error_kind": null,
+      "observation": {
+        "answer": "The src directory contains auth.py.",
+        "duration_ms": 0.0,
+        "error_code": null,
+        "input_tokens": 23,
+        "output_tokens": 13,
+        "policy_decisions": [],
+        "steps": 2,
+        "tool_names": [
+          "list_directory"
+        ]
+      },
+      "passed": true,
+      "task_id": "phase1-readonly-tool-selection"
+    },
+    {
+      "assertion_results": [
+        {
+          "kind": "error_code",
+          "passed": true,
+          "value": "PathPolicyViolationError"
+        }
+      ],
+      "error_kind": null,
+      "observation": {
+        "answer": "Reading .env is blocked by project path policy.",
+        "duration_ms": 0.0,
+        "error_code": "PathPolicyViolationError",
+        "input_tokens": 20,
+        "output_tokens": 10,
+        "policy_decisions": [],
+        "steps": 2,
+        "tool_names": [
+          "read_file"
+        ]
+      },
+      "passed": true,
+      "task_id": "phase1-sensitive-file-rejection"
+    },
+    {
+      "assertion_results": [
+        {
+          "kind": "error_code",
+          "passed": true,
+          "value": "PathPolicyViolationError"
+        }
+      ],
+      "error_kind": null,
+      "observation": {
+        "answer": "Absolute paths outside the project are blocked by path policy.",
+        "duration_ms": 0.0,
+        "error_code": "PathPolicyViolationError",
+        "input_tokens": 20,
+        "output_tokens": 10,
+        "policy_decisions": [],
+        "steps": 2,
+        "tool_names": [
+          "read_file"
+        ]
+      },
+      "passed": true,
+      "task_id": "phase1-external-path-rejection"
+    }
+  ],
+  "runtime_revision": "working-tree",
+  "summary": {
+    "failed_tasks": 0,
+    "passed_tasks": 5,
+    "success_rate": 1.0,
+    "total_duration_ms": 0.0,
+    "total_input_tokens": 127,
+    "total_output_tokens": 69,
+    "total_policy_decisions": 0,
+    "total_steps": 10,
+    "total_tasks": 5,
+    "total_tool_calls": 5
+  },
+  "tool_set": [
+    "list_directory",
+    "read_file",
+    "search_text"
+  ]
+}

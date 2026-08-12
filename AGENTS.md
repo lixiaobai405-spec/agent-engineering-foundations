@@ -6,7 +6,7 @@
 
 本项目以系统学习 Agent Engineering（智能体工程）为第一目标。
 
-当前目标是从零实现一个可测试、可观察、安全受控的 Python Agent Runtime（智能体运行时），并以只读代码分析 Agent 作为第一阶段产品验证。
+当前目标是从零实现一个可测试、可观察、安全受控的 Python Agent Runtime（智能体运行时）。第一阶段已用只读代码分析 Agent 和本机 Chat 控制面完成产品验证；第二阶段将以可控 Coding Agent 验证规划、持久化执行、受控写入和隔离命令反馈。
 
 学习优先于交付速度：
 
@@ -20,10 +20,12 @@
 执行前按以下顺序阅读：
 
 1. `docs/agent-plans/2026-07-20-agent-engineering-learning-design.md`
-2. `docs/agent-plans/2026-07-21-phase-1-implementation-plan.md`
-3. `docs/agent-plans/2026-08-02-phase-1d-interactive-chat-ui-design.md`
-4. `docs/agent-plans/2026-08-02-phase-1d-interactive-chat-ui-plan.md`
-5. 当前被用户明确指定执行的 Task
+2. `docs/agent-plans/2026-08-08-phase-2-controllable-coding-agent-design.md`
+3. `docs/agent-plans/2026-08-08-phase-2-controllable-coding-agent-plan.md`
+4. `docs/agent-plans/2026-07-21-phase-1-implementation-plan.md`
+5. `docs/agent-plans/2026-08-02-phase-1d-interactive-chat-ui-design.md`
+6. `docs/agent-plans/2026-08-02-phase-1d-interactive-chat-ui-plan.md`
+7. 当前由 planner 单独生成且经用户确认的 Task 执行 prompt
 
 第一阶段计划：
 
@@ -31,6 +33,12 @@
 - Phase 1B：`docs/agent-plans/2026-07-21-phase-1b-readonly-agent-plan.md`
 - Phase 1C：`docs/agent-plans/2026-07-21-phase-1c-trace-viewer-plan.md`
 - Phase 1D：`docs/agent-plans/2026-08-02-phase-1d-interactive-chat-ui-plan.md`
+
+第二阶段设计：
+
+- Phase 2：`docs/agent-plans/2026-08-08-phase-2-controllable-coding-agent-design.md`
+- Phase 2 实施：`docs/agent-plans/2026-08-08-phase-2-controllable-coding-agent-plan.md`
+- Phase 2 详细实施计划已生成，但尚无经用户确认的单 Task 执行 prompt；不得自行开始实现。
 
 优先级：
 
@@ -44,38 +52,37 @@
 
 ## 3. 当前阶段边界
 
-Phase 1A 已于 2026-07-25 通过用户验收，Phase 1B 与 Phase 1C 已于 2026-08-01 通过用户验收。
-当前阶段为 Phase 1D。每次会话只能执行用户当前明确指定的一个 Task；真实进度以 Phase 1D 计划中的已验证复选框和用户验收为准，不在本文件中固定某个 Task 为永久当前任务。
+Phase 1A 已于 2026-07-25 通过用户验收，Phase 1B 与 Phase 1C 已于 2026-08-01 通过用户验收，Phase 1D 与第一阶段总体验收已于 2026-08-08 由用户确认通过。
 
-Phase 1D 允许实现：
+当前阶段为 Phase 2“可控 Coding Agent”的实施准备阶段。Phase 2 详细实施计划已生成，但没有已授权的实现 Task；用户将另行让 planner 为单个 Task 生成执行 prompt。在 prompt 获得用户确认前，不得修改生产代码或自行选择 Phase 2A 的第一个 Task。未来每次会话仍只能执行用户当前明确指定的一个 Task，真实进度以已确认实施计划、Task evidence、独立验收和用户确认共同为准。
 
-- Chat 领域模型、SQLite 持久化、FastAPI Chat API 与 SSE
-- React + TypeScript + Vite 本机 Chat UI（`127.0.0.1` 绑定）
-- `PROJECT_READ_ONLY` 与 `ASK_FOR_ACCESS` 两种只读权限模式
-- 项目外只读访问的一次性审批（exact path，非永久授权）
-- Chat 与现有 Trace Viewer / JSONL Trace 的关联与投影
-- 单元测试、集成测试、浏览器端到端测试
-- Ruff、mypy、TypeScript 构建与类型检查
-- `README.md` 与 `docs/learning-notes/04-chat-control-plane.md`
+Phase 2 按顺序分为四个权限递增的子里程碑：
 
-Phase 1D 禁止提前实现：
+- Phase 2A：Offline Agent Eval、Planning、Todo 和受限重规划；保持只读。
+- Phase 2B：Durable Execution 与 Unified Diff / Patch 生成、校验和预览；不得写文件。
+- Phase 2C：Approval、Policy、Capability、Permission Profile、ExecutionBackend 与 Sandbox 分层；通过门禁后只开放项目内受控 `apply_patch`。
+- Phase 2D：Sandbox 内受限 `run_command`、项目既定测试反馈和只读 `git_status`、`git_diff`、`git_log`。
 
-- 写文件、删除文件、Shell、Git、网络工具
-- 写操作、命令或网络访问的审批
-- 永久目录授权、“本次会话全部允许”或真正的 unrestricted full access
-- 远程绑定、登录或多租户部署
-- Planning、Checkpoint、Memory、Skills、Hooks、MCP、Sandbox、Sub-Agent
-- 未经用户当前任务明确确认的真实模型或付费 API Smoke Test
+前一个子里程碑未完成自动验证、evidence 和用户验收时，不得扩大下一层 Tool 或权限。即使未来实施计划已经创建，也必须继续一次只执行一个明确 Task。
 
-只有 Phase 1D 完成条件全部满足并经用户确认后，才进入第二阶段“可控 Coding Agent”。
+Phase 2 禁止提前实现：
+
+- MCP、ACP、A2A、Memory、Skills、Hooks、Sub-Agent。
+- Browser、桌面 GUI、通用 Computer Use、网络 Tool 或包安装。
+- 项目外写入、任意 Shell、系统配置修改或 Git 写操作。
+- `TrustedHostExecutor`、`HOST_FULL_ACCESS` 或其他电脑级完全访问；它们只允许在 Phase 5 第 19 周通过独立安全设计和用户确认门后实施。
+- Token streaming、远程绑定、登录、多租户或生产部署。
+- 未经用户当前任务明确确认的真实模型或付费 API Smoke Test。
+
+Phase 2 的 `PROJECT_FULL_ACCESS` 只表示项目范围内已实现能力可按版本化 Policy 自动执行，仍受硬 Policy 与 Sandbox 限制，不表示可不受限访问终端、互联网或电脑文件。
 
 ## 4. 执行模型的角色
 
 项目支持以下显式角色：
 
-- `planner`：只维护目标、范围、步骤和验收标准，不实现代码。
-- `executor`：严格执行当前计划，不自行扩展范围。
-- `reviewer`：对照计划和验收标准审查，不直接修改代码。
+- `planner`：只维护目标、范围、步骤和验收标准，不实现代码；为每个实现型 Task 定义明确的分层验证合同。
+- `executor`：严格执行当前计划和验证合同，不自行扩展范围，也不以不必要的全量测试替代目标测试。
+- `reviewer`：对照计划和验收标准审查，不直接修改代码；独立选择最小充分验证，并在风险触发时扩大验证范围。
 - `tutor`：解释项目中的概念、取舍和错误，不接管实施。
 - `context-guardian`：维护跨对话上下文，不替代其他角色。
 
@@ -83,22 +90,23 @@ Phase 1D 禁止提前实现：
 
 ### 跨对话 Task evidence
 
-实现型 Task 默认使用 `docs/task-evidence/<task-id>.md` 保存跨对话证据，具体格式以 `docs/task-evidence/_template.md` 为准。`task-id` 应稳定且可从当前计划定位，例如 `phase-1d-task-5`。如果当前计划或 `task-spec.md` 已指定其他路径，以明确指定的路径为准。
+实现型 Task 默认使用 `docs/task-evidence/<task-id>.md` 保存跨对话证据，具体格式以 `docs/task-evidence/_template.md` 为准。`task-id` 应稳定且可从当前计划定位，例如未来的 `phase-2a-task-1`。如果当前计划或 `task-spec.md` 已指定其他路径，以明确指定的路径为准。
 
-- `planner`：在计划或 `task-spec.md` 中明确 Task ID、evidence 路径、是否要求 TDD、Red/Green 命令和质量门禁；不把 executor 的运行结果写进 planner 拥有的规范文档。
+- `planner`：在计划或 `task-spec.md` 中明确 Task ID、evidence 路径、是否要求 TDD、Red/Green 命令、目标测试、受影响回归、是否要求完整基线、判断理由和其他质量门禁；不把 executor 的运行结果写进 planner 拥有的规范文档。
 - `executor`：在修改生产代码前创建或更新 evidence，记录修改前状态；在命令实际运行时写入 Red、Green、退出码、关键原始输出、质量门禁和范围检查。最终回复只提供摘要和 evidence 链接。
 - `reviewer`：读取 evidence，但把它视为 executor 提交的材料而不是独立证明；必须检查当前代码和 diff，并亲自重跑足以支持结论的当前验证。
 - `context-guardian`：交接时说明当前 Task evidence 路径，以及 Red、Green 和 reviewer 独立验证是否存在。
 
 缺失的历史 Red 必须标记为 `unavailable`，不得凭记忆补写，也不得在实现完成后临时破坏代码并冒充原始 Red。reviewer 必须分别报告当前实现和 TDD 过程证据；新鲜复验只能证明当前行为，不能独立证明历史 Red→Green 顺序。既有 Task 不要求追溯生成虚假的 evidence。
 
-交给 Claude、DeepSeek 或其他模型执行 Phase 1D 时，建议使用：
+交给 Claude、DeepSeek 或其他模型执行 Phase 2 时，建议使用：
 
 ```text
-你是 executor。先完整阅读项目根目录 AGENTS.md、已确认设计文档和 Phase 1D 计划。
-严格按 Phase 1D 的 Task 顺序执行，一次只处理用户当前明确指定的一个 Task，不扩大范围。
+你是 executor。先完整阅读项目根目录 AGENTS.md、Phase 2 权威设计、已确认的 Phase 2 实施计划和当前 Task。
+如果 Phase 2 实施计划或用户明确指定的 Task 不存在，保持等待，不修改任何文件。
+严格按当前子里程碑的 Task 顺序执行，一次只处理用户当前明确指定的一个 Task，不扩大 Tool 或权限范围。
 每个 Task 都要先展示失败测试证据，再实现最小代码，然后运行指定验证。
-未经我明确授权，不要安装依赖、调用真实模型、commit、push、创建 PR，也不要进入第二阶段。
+未经我明确授权，不要安装依赖、调用真实模型、commit、push、创建 PR，也不要进入下一子里程碑或实现 Phase 2 非目标。
 ```
 
 ## 5. 标准执行流程
@@ -169,6 +177,50 @@ TDD evidence 规则：
 - evidence 不得包含真实 `.env` 值、密钥、Token、Cookie、密码、私钥或其他敏感载荷。
 - reviewer 可以评价提交的 TDD 证据是否完整、内部一致，但不得声称独立见证了历史过程。
 
+### 分层验证合同
+
+planner 必须为每个实现型 Task 在计划、`task-spec.md` 或当前经用户确认的 Task prompt 中明确以下字段：
+
+```text
+Target tests：
+Affected regression tests：
+Full suite：required / not-required
+Full suite reason：
+Additional gates：
+```
+
+- `Target tests` 必须是能证明当前目标行为的精确命令、测试文件或测试目录；不得只写“运行相关测试”。
+- `Affected regression tests` 必须覆盖本次改动直接影响的调用方、集成路径或安全边界。
+- `Full suite` 表示是否要求运行本节定义的完整回归基线；planner 必须根据风险写明 `required` 或 `not-required`，不得留给 executor 临时猜测。
+- `Additional gates` 用于列出当前 Phase 新增的 Eval、恢复、安全、Sandbox、Docker、前端或其他专项门禁；没有时明确写 `none`。
+
+executor 按以下层级执行验证：
+
+1. Red 阶段只运行能证明目标行为缺失的最小测试，并保存有效失败证据。
+2. Green 阶段重新运行相同目标测试，证明最小实现满足目标行为。
+3. Task 完成前运行全部 `Target tests`、`Affected regression tests` 和 `Additional gates`。
+4. 只有验证合同将 `Full suite` 标记为 `required` 时，才把完整回归基线作为当前 Task 的必需门禁。
+
+完整基线不能替代原始 Red、目标测试或计划指定的受影响回归命令。executor 如果在执行中发现新的跨模块风险，可以扩大测试范围，但必须在 evidence 中记录新增命令、原因和结果；不得擅自缩小 planner 已定义的验证范围。
+
+reviewer 必须检查当前代码和完整 diff，并独立运行足以支持结论的最小充分验证：
+
+- 重新运行关键目标测试，并根据实际调用关系抽查受影响回归，而不是机械重复 executor 的全部命令。
+- 对 Policy、Approval、Capability、持久化、恢复、Sandbox 等高风险边界增加必要的直接 probe。
+- 普通 Task 不要求机械重跑全部 pytest；如果实际 diff 超出计划、影响范围无法可靠界定或局部验证出现跨模块回归迹象，应扩大验证并把范围差异列为发现。
+- reviewer 的新鲜验证只能证明当前行为；TDD 历史过程仍以 executor 在修改生产代码前保存的 evidence 为准。
+
+以下情况 `Full suite` 必须为 `required`：
+
+- 当前 Task 是子里程碑的最后一个 Task。
+- 当前 Task 完成后将扩大 Agent 的 Tool、Capability、Permission Profile、写入或命令执行权限。
+- 当前 Task 属于阶段最终验收或用户要求的完整 reviewer 验收。
+- 修改共享核心协议、全局 migration 框架，或者实际影响范围无法可靠界定。
+- 当前权威计划明确要求完整基线。
+- 目标测试或受影响回归暴露出跨模块失败迹象。
+
+若 `Full suite` 为 `not-required`，executor 和 reviewer 必须准确报告 `targeted verification passed`，不得写成 `full suite passed` 或“全部测试通过”。
+
 每个 Task 的最低验证：
 
 - 指定的 pytest 测试通过。
@@ -176,7 +228,7 @@ TDD evidence 规则：
 - 受影响模块通过 mypy strict。
 - `git diff --check` 无空白错误。
 
-Phase 1D 完成前必须运行：
+Phase 1 的完整回归基线为：
 
 ```powershell
 conda run -n agent-foundations python -m pytest -q
@@ -191,7 +243,7 @@ npm run build:chat
 git diff --check
 ```
 
-其中 Chat 前端命令从 Phase 1D Task 10 安装并接入对应依赖后才可执行；在此之前不得为了运行尚不存在的脚本而提前安装依赖或扩大当前 Task。
+Phase 2 每个 Task 运行受影响范围的门禁；每个扩大权限的子里程碑完成前必须重跑上述 Phase 1 完整基线。Phase 2 新增的 Eval、恢复、安全、Sandbox 和前端命令必须由后续实施计划逐项定义；不得为了运行尚不存在的脚本而提前安装依赖或扩大当前 Task。
 
 没有最新命令输出，不得声称“完成”“修复”或“全部通过”。
 
@@ -238,6 +290,18 @@ Evidence：
 - 当前验证状态：pass / partial / fail
 - TDD 过程证据：complete / incomplete / not-applicable
 - 未验证项或证据缺口：
+
+验证合同：
+- Target tests：
+- Affected regression tests：
+- Full suite：required / not-required
+- Full suite reason：
+- Additional gates：
+
+实际验证：
+- 已运行：
+- 未运行：
+- 扩大范围或未执行项的理由：
 
 修改文件：
 - path：修改目的

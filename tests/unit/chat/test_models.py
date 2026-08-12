@@ -7,6 +7,7 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+import agent_foundations.chat.models as chat_models
 from agent_foundations.chat.models import (
     AccessOperation,
     AccessScope,
@@ -183,6 +184,66 @@ def test_visible_message_roles_exclude_system_and_tool() -> None:
         RunStatus.RUNNING,
         RunStatus.WAITING_APPROVAL,
     }
+
+
+def test_tool_activity_requires_bounded_safe_summary() -> None:
+    activity_type = getattr(chat_models, "ChatToolActivity", None)
+    status_type = getattr(chat_models, "ToolActivityStatus", None)
+    assert activity_type is not None, "ChatToolActivity is not implemented"
+    assert status_type is not None, "ToolActivityStatus is not implemented"
+
+    activity = activity_type(
+        conversation_id=CONVERSATION_ID,
+        session_id=SESSION_ID,
+        tool_call_id="call-1",
+        tool_name="read_file",
+        status=status_type.RUNNING,
+        arguments_summary="README.md",
+        started_at=NOW,
+        last_event_id=EVENT_ID,
+    )
+
+    assert activity.status is status_type.RUNNING
+    assert status_type.terminal() == {
+        status_type.COMPLETED,
+        status_type.FAILED,
+        status_type.INTERRUPTED,
+    }
+    with pytest.raises(ValidationError, match="at most 240 characters"):
+        activity_type.model_validate(
+            {**activity.model_dump(), "arguments_summary": "x" * 241},
+        )
+
+
+def test_tool_activity_validates_identity_and_timestamps() -> None:
+    activity_type = getattr(chat_models, "ChatToolActivity", None)
+    status_type = getattr(chat_models, "ToolActivityStatus", None)
+    assert activity_type is not None, "ChatToolActivity is not implemented"
+    assert status_type is not None, "ToolActivityStatus is not implemented"
+
+    with pytest.raises(ValidationError):
+        activity_type(
+            conversation_id="not-a-uuid",
+            session_id=SESSION_ID,
+            tool_call_id="call-1",
+            tool_name="read_file",
+            status=status_type.COMPLETED,
+            started_at=NOW,
+            finished_at=NOW,
+            last_event_id=EVENT_ID,
+        )
+
+    with pytest.raises(ValidationError, match="timezone-aware"):
+        activity_type(
+            conversation_id=CONVERSATION_ID,
+            session_id=SESSION_ID,
+            tool_call_id="call-1",
+            tool_name="read_file",
+            status=status_type.COMPLETED,
+            started_at=NAIVE,
+            finished_at=NOW,
+            last_event_id=EVENT_ID,
+        )
 
 
 def test_access_dimensions_are_explicit() -> None:

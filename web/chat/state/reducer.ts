@@ -3,11 +3,13 @@ import type {
   ActiveApproval,
   ChatEvent,
   ChatMessage,
+  ChatToolActivity,
   Conversation,
   ConversationStateResponse,
   PendingApprovalState,
   RunRecord,
   RunStatus,
+  ToolActivityStatus,
 } from "./types";
 
 export interface ChatState {
@@ -15,7 +17,8 @@ export interface ChatState {
   activeConversationId: string | null;
   messagesByConversation: Record<string, ChatMessage[]>;
   runsByConversation: Record<string, RunRecord[]>;
-  activitiesByConversation: Record<string, ChatEvent[]>;
+  activitiesByConversation: Record<string, ChatToolActivity[]>;
+  activitiesErrorByConversation: Record<string, string | null>;
   runStatusByConversation: Record<string, RunStatus>;
   activeSessionIdByConversation: Record<string, string | null>;
   latestSessionIdByConversation: Record<string, string | null>;
@@ -32,6 +35,7 @@ export const initialState: ChatState = {
   messagesByConversation: {},
   runsByConversation: {},
   activitiesByConversation: {},
+  activitiesErrorByConversation: {},
   runStatusByConversation: {},
   activeSessionIdByConversation: {},
   latestSessionIdByConversation: {},
@@ -50,6 +54,12 @@ export type ChatAction =
   | { type: "messages.loading"; conversationId: string }
   | { type: "messages.loaded"; conversationId: string; messages: ChatMessage[] }
   | { type: "runs.loaded"; conversationId: string; runs: RunRecord[] }
+  | {
+      type: "activities.loaded";
+      conversationId: string;
+      activities: ChatToolActivity[];
+    }
+  | { type: "activities.error"; conversationId: string; error: string }
   | { type: "messages.error"; conversationId: string; error: string }
   | { type: "run.loaded"; conversationId: string; run: RunRecord | null }
   | {
@@ -90,14 +100,76 @@ function mergeMessages(
   return [...byId.values()].sort((left, right) => left.sequence - right.sequence);
 }
 
-function appendActivity(
-  activitiesByConversation: Record<string, ChatEvent[]>,
-  event: ChatEvent,
-): Record<string, ChatEvent[]> {
-  const current = activitiesByConversation[event.conversation_id] ?? [];
+const TERMINAL_ACTIVITY_STATUSES = new Set<ToolActivityStatus>([
+  "completed",
+  "failed",
+  "interrupted",
+]);
+
+function activityKey(activity: ChatToolActivity): string {
+  return `${activity.session_id}\u0000${activity.tool_call_id}`;
+}
+
+function mergeActivities(
+  existing: ChatToolActivity[],
+  incoming: ChatToolActivity[],
+): ChatToolActivity[] {
+  const byKey = new Map<string, ChatToolActivity>();
+  for (const activity of existing) {
+    byKey.set(activityKey(activity), activity);
+  }
+  for (const activity of incoming) {
+    const key = activityKey(activity);
+    const current = byKey.get(key);
+    if (current && TERMINAL_ACTIVITY_STATUSES.has(current.status)) {
+      continue;
+    }
+    byKey.set(key, current ? {
+      ...activity,
+      arguments_summary: activity.arguments_summary ?? current.arguments_summary,
+      result_summary: activity.result_summary ?? current.result_summary,
+      started_at: current.started_at,
+    } : activity);
+  }
+  return [...byKey.values()].sort(
+    (left, right) =>
+      left.started_at.localeCompare(right.started_at) ||
+      left.tool_call_id.localeCompare(right.tool_call_id),
+  );
+}
+
+function activityFromEvent(event: ChatEvent): ChatToolActivity | null {
+  if (
+    event.type !== "tool.requested" &&
+    event.type !== "tool.completed" &&
+    event.type !== "tool.failed"
+  ) {
+    return null;
+  }
+  const toolCallId = event.data.tool_call_id;
+  const toolName = event.data.name;
+  if (!isNonEmptyString(toolCallId) || !isNonEmptyString(toolName)) {
+    return null;
+  }
+  const status: ToolActivityStatus =
+    event.type === "tool.requested"
+      ? "running"
+      : event.type === "tool.completed"
+        ? "completed"
+        : "failed";
+  const argumentsSummary = event.data.arguments_summary;
+  const resultSummary = event.data.result_summary;
   return {
-    ...activitiesByConversation,
-    [event.conversation_id]: [...current, event],
+    conversation_id: event.conversation_id,
+    session_id: event.session_id,
+    tool_call_id: toolCallId,
+    tool_name: toolName,
+    status,
+    arguments_summary: isNonEmptyString(argumentsSummary) ? argumentsSummary : null,
+    result_summary: isNonEmptyString(resultSummary) ? resultSummary : null,
+    started_at: event.occurred_at,
+    finished_at: status === "running" ? null : event.occurred_at,
+    last_event_id: event.event_id,
   };
 }
 
@@ -319,6 +391,29 @@ export function reduceChatState(state: ChatState, action: ChatAction): ChatState
           [action.conversationId]: action.runs,
         },
       };
+    case "activities.loaded":
+      return {
+        ...state,
+        activitiesByConversation: {
+          ...state.activitiesByConversation,
+          [action.conversationId]: mergeActivities(
+            state.activitiesByConversation[action.conversationId] ?? [],
+            action.activities,
+          ),
+        },
+        activitiesErrorByConversation: {
+          ...state.activitiesErrorByConversation,
+          [action.conversationId]: null,
+        },
+      };
+    case "activities.error":
+      return {
+        ...state,
+        activitiesErrorByConversation: {
+          ...state.activitiesErrorByConversation,
+          [action.conversationId]: action.error,
+        },
+      };
     case "run.loaded": {
       return applyRecoveredRunState(
         state,
@@ -340,10 +435,19 @@ export function reduceChatState(state: ChatState, action: ChatAction): ChatState
       }
       const { event } = action;
       const conversationId = event.conversation_id;
-      let nextState: ChatState = {
-        ...state,
-        activitiesByConversation: appendActivity(state.activitiesByConversation, event),
-      };
+      const liveActivity = activityFromEvent(event);
+      let nextState: ChatState = liveActivity
+        ? {
+            ...state,
+            activitiesByConversation: {
+              ...state.activitiesByConversation,
+              [conversationId]: mergeActivities(
+                state.activitiesByConversation[conversationId] ?? [],
+                [liveActivity],
+              ),
+            },
+          }
+        : state;
 
       switch (event.type) {
         case "run.started":

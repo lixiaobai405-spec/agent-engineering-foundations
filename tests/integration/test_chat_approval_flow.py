@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
+import pytest
 from fastapi.testclient import TestClient
 
 from agent_foundations.chat.approvals import ApprovalCoordinator
+from agent_foundations.chat.errors import ChatNotFoundError
 from agent_foundations.chat.events import ChatEventBroker
 from agent_foundations.chat.models import (
+    AccessOperation,
+    ApprovalDecision,
+    ApprovalRequest,
     ApprovalStatus,
     ChatEvent,
     ChatEventType,
@@ -32,12 +38,19 @@ from agent_foundations.runtime.loop import AgentLoop
 from agent_foundations.runtime.redaction import Redactor
 from agent_foundations.runtime.tool_execution import ToolCallExecutor
 from agent_foundations.runtime.trace import EventSink
-from agent_foundations.tools.filesystem.list_directory import ListDirectoryTool
-from agent_foundations.tools.filesystem.path_policy import PathPolicy
-from agent_foundations.tools.filesystem.read_file import ReadFileTool
-from agent_foundations.tools.filesystem.search_text import SearchTextTool
-from agent_foundations.tools.registry import ToolRegistry
+from agent_foundations.security.approvals import AuthorizationStatus
+from agent_foundations.security.models import (
+    PermissionProfile,
+    PermissionProfileName,
+    PolicyRequest,
+    PolicyResource,
+    ResourceScope,
+    default_allowed_tools,
+)
+from agent_foundations.security.policy import PolicyEngine
+from agent_foundations.tools.filesystem.read_file import READ_FILE_MANIFEST
 from agent_foundations.viewer.app import create_app
+from tests.unit.tools.registry_helpers import readonly_tool_registry
 
 
 def _require_task9_components() -> tuple[Any, Any, Any]:
@@ -90,16 +103,9 @@ def _runtime_factory(provider: FakeModelProvider) -> Any:
         event_sink: EventSink,
         tool_executor: ToolCallExecutor,
     ) -> AgentLoop:
-        policy = PathPolicy(Path(conversation.project_root))
         return AgentLoop(
             provider=provider,
-            registry=ToolRegistry(
-                [
-                    ListDirectoryTool(policy),
-                    ReadFileTool(policy),
-                    SearchTextTool(policy),
-                ],
-            ),
+            registry=readonly_tool_registry(Path(conversation.project_root)),
             context_builder=ContextBuilder(ContextBudget()),
             event_sink=event_sink,
             config=AgentConfig(max_steps=8),
@@ -358,6 +364,31 @@ def test_external_approval_api_approve_repeat_and_deny_flow(
         ]
 
     assert asyncio.run(repository.get_run(first_session)).status is RunStatus.COMPLETED
+    with sqlite3.connect(tmp_path / "state" / "chat.sqlite3") as connection:
+        authorization_rows = connection.execute(
+            """
+            SELECT authorization_id, status
+            FROM authorization_requests
+            ORDER BY requested_at, authorization_id
+            """,
+        ).fetchall()
+        capability_rows = connection.execute(
+            """
+            SELECT authorization_id, consumed_at
+            FROM capabilities
+            ORDER BY issued_at, capability_id
+            """,
+        ).fetchall()
+    assert {row[0] for row in authorization_rows} == seen_ids | {denied_approval}
+    assert [row[1] for row in authorization_rows].count("approved") == 2
+    assert [row[1] for row in authorization_rows].count("denied") == 1
+    assert len(capability_rows) == 2
+    assert all(row[1] is not None for row in capability_rows)
+    serialized_events = json.dumps(
+        [event.model_dump(mode="json") for event in broker.events],
+    )
+    assert "resource_json" not in serialized_events
+    assert "capability_id" not in serialized_events
 
 
 def test_approval_decision_validation_and_unavailable_pending_record(
@@ -497,3 +528,118 @@ def test_chat_lifespan_shuts_down_coordinator_before_supervisor(
         assert client.get("/api/chat/conversations").status_code == 200
 
     assert shutdown_order == ["coordinator", "supervisor"]
+
+
+def test_capability_insert_failure_can_resume_exact_approved_legacy_request(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    external = tmp_path / "external.txt"
+    external.write_text("external fixture\n", encoding="utf-8")
+    repository = ConversationRepository(tmp_path / "state" / "chat.sqlite3")
+    asyncio.run(repository.initialize())
+    conversation = asyncio.run(
+        repository.create_conversation(
+            title="Recover exact approval",
+            project_root=project,
+            permission_mode=PermissionMode.ASK_FOR_ACCESS,
+        ),
+    )
+    _message, run = asyncio.run(
+        repository.begin_run(
+            conversation.conversation_id,
+            content="read exact fixture",
+            session_id=str(uuid4()),
+        ),
+    )
+    asyncio.run(
+        repository.transition_run(
+            run.session_id,
+            RunStatus.QUEUED,
+            RunStatus.RUNNING,
+        ),
+    )
+    coordinator = ApprovalCoordinator(repository, RecordingBroker())
+    approval = ApprovalRequest(
+        conversation_id=conversation.conversation_id,
+        session_id=run.session_id,
+        tool_call_id="recover-call",
+        tool_name="read_file",
+        canonical_path=str(external.resolve()),
+        operation=AccessOperation.READ,
+    )
+    profile = PermissionProfile(
+        name=PermissionProfileName.ASK_ALWAYS,
+        version=1,
+        allowed_tools=default_allowed_tools(PermissionProfileName.ASK_ALWAYS),
+    )
+    policy_request = PolicyRequest(
+        profile_version=profile.version,
+        run_id=run.session_id,
+        tool_call_id=approval.tool_call_id,
+        tool_name=approval.tool_name,
+        manifest=READ_FILE_MANIFEST,
+        resource=PolicyResource(
+            kind="project_path",
+            scope=ResourceScope.EXTERNAL_EXACT_PATH,
+            identifier=approval.canonical_path,
+        ),
+        operation="read",
+    )
+    outcome = PolicyEngine().decide(profile, policy_request)
+    attempts = 0
+
+    def fail_first_insert() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlite3.OperationalError("injected adapter capability failure")
+
+    coordinator._authorization_repository._before_capability_insert = fail_first_insert
+
+    async def first_attempt() -> None:
+        task = asyncio.create_task(
+            coordinator.request_capability(approval, policy_request, outcome),
+        )
+        for _ in range(100):
+            try:
+                pending = await repository.get_approval(approval.approval_id)
+            except ChatNotFoundError:
+                await asyncio.sleep(0)
+                continue
+            if pending.status is ApprovalStatus.PENDING:
+                break
+        else:
+            raise AssertionError("legacy approval did not become pending")
+        await coordinator.resolve(approval.approval_id, ApprovalDecision.APPROVE)
+        with pytest.raises(sqlite3.OperationalError, match="injected adapter"):
+            await task
+
+    asyncio.run(first_attempt())
+    generic = asyncio.run(
+        coordinator._authorization_repository.get_authorization(
+            approval.approval_id,
+        ),
+    )
+    legacy = asyncio.run(repository.get_approval(approval.approval_id))
+    assert generic.status is AuthorizationStatus.PENDING
+    assert legacy.status is ApprovalStatus.APPROVED
+
+    recovered = asyncio.run(
+        coordinator.request_capability(approval, policy_request, outcome),
+    )
+    assert recovered is not None
+    assert recovered.authorization_id == approval.approval_id
+    recovered_generic = asyncio.run(
+        coordinator._authorization_repository.get_authorization(
+            approval.approval_id,
+        ),
+    )
+    assert recovered_generic.status is AuthorizationStatus.APPROVED
+    assert attempts == 2
+    assert asyncio.run(
+        coordinator._authorization_repository.count_capabilities(
+            approval.approval_id,
+        ),
+    ) == 1

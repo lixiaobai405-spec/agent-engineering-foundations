@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -7,7 +8,7 @@ from pytest import MonkeyPatch
 from typer.testing import CliRunner
 
 from agent_foundations.cli import main
-from agent_foundations.runtime.agent import AgentResult
+from agent_foundations.runtime.agent import AgentResult, PlanningMode
 from agent_foundations.runtime.sinks import CompositeEventSink, JsonlEventSink, LiveEventSink
 
 # ── Fake runtime ─────────────────────────────────────────────────────────
@@ -173,6 +174,7 @@ def test_analyze_passes_default_trace_dir_and_no_viewer_url(
         root: Path,
         trace_dir: Path,
         viewer_url: str | None,
+        planning_mode: PlanningMode = PlanningMode.DISABLED,
     ) -> FakeLoop:
         captured.update({
             "root": root,
@@ -207,6 +209,7 @@ def test_analyze_passes_viewer_url(
         root: Path,
         trace_dir: Path,
         viewer_url: str | None,
+        planning_mode: PlanningMode = PlanningMode.DISABLED,
     ) -> FakeLoop:
         captured["viewer_url"] = viewer_url
         return FakeLoop("Everything is fine.")
@@ -300,7 +303,9 @@ def test_analyze_loads_credentials_from_dotenv_file(
     monkeypatch.setattr(
         main,
         "build_runtime",
-        lambda root, trace_dir, viewer_url: FakeLoop("Loaded from dotenv."),
+        lambda root, trace_dir, viewer_url, planning_mode=PlanningMode.DISABLED: FakeLoop(
+            "Loaded from dotenv.",
+        ),
     )
     result = CliRunner().invoke(
         main.app,
@@ -319,7 +324,9 @@ def test_fake_loop_success_renders_answer(
     monkeypatch.setattr(
         main,
         "build_runtime",
-        lambda root, trace_dir, viewer_url: FakeLoop("Everything is fine."),
+        lambda root, trace_dir, viewer_url, planning_mode=PlanningMode.DISABLED: FakeLoop(
+            "Everything is fine.",
+        ),
     )
     result = CliRunner().invoke(
         main.app, ["analyze", str(tmp_path), "inspect"],
@@ -339,7 +346,7 @@ def test_fake_loop_failure_returns_exit_1(
     monkeypatch.setattr(
         main,
         "build_runtime",
-        lambda root, trace_dir, viewer_url: ExplodingLoop(),
+        lambda root, trace_dir, viewer_url, planning_mode=PlanningMode.DISABLED: ExplodingLoop(),
     )
     result = CliRunner().invoke(
         main.app, ["analyze", str(tmp_path), "inspect"],
@@ -422,3 +429,414 @@ def test_build_runtime_passes_sdk_config(
     assert captured["base_url"] == "https://custom.example/v1"
     assert captured["timeout"] == 60.0
     assert captured["max_retries"] == 2
+
+
+# ── Offline evaluate ─────────────────────────────────────────────────────
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TASK_SET_PATH = REPO_ROOT / "tests" / "fixtures" / "evals" / "phase-1-tasks-v1.json"
+RESPONSES_PATH = REPO_ROOT / "tests" / "fixtures" / "evals" / "phase-1-responses-v1.json"
+FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures"
+SAMPLE_PROJECT_PATH = FIXTURE_ROOT / "sample_project"
+
+
+def offline_evaluate_args(output: Path) -> list[str]:
+    return [
+        "evaluate",
+        "--task-set",
+        str(TASK_SET_PATH),
+        "--responses",
+        str(RESPONSES_PATH),
+        "--output",
+        str(output),
+        "--runtime-revision",
+        "working-tree",
+    ]
+
+
+def test_help_shows_evaluate_command() -> None:
+    result = CliRunner().invoke(main.app, ["--help"])
+    assert result.exit_code == 0
+    assert "evaluate" in result.output
+
+
+def test_evaluate_command_does_not_require_model_credentials(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("AGENT_API_KEY", raising=False)
+    monkeypatch.delenv("AGENT_MODEL", raising=False)
+    output = tmp_path / "report.json"
+    result = CliRunner().invoke(main.app, offline_evaluate_args(output))
+    assert result.exit_code == 0
+
+
+def test_evaluate_does_not_load_dotenv(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AGENT_API_KEY", raising=False)
+    (tmp_path / ".env").write_text("AGENT_API_KEY=from-dotenv\n", encoding="utf-8")
+    output = tmp_path / "report.json"
+
+    load_calls = 0
+
+    def track_load() -> None:
+        nonlocal load_calls
+        load_calls += 1
+        main.load_cli_env()
+
+    monkeypatch.setattr(main, "load_cli_env", track_load)
+    result = CliRunner().invoke(
+        main.app,
+        [
+            "evaluate",
+            "--task-set",
+            str(TASK_SET_PATH),
+            "--responses",
+            str(RESPONSES_PATH),
+            "--output",
+            str(output),
+            "--runtime-revision",
+            "working-tree",
+        ],
+    )
+    assert result.exit_code == 0
+    assert load_calls == 0
+    assert os.getenv("AGENT_API_KEY") is None
+
+
+def test_evaluate_does_not_build_real_provider(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("AGENT_API_KEY", raising=False)
+
+    def fail_build() -> object:
+        raise AssertionError("build_provider must not be called")
+
+    monkeypatch.setattr(main, "build_provider", fail_build)
+    def fail_openai(**kwargs: object) -> object:
+        raise AssertionError("openai")
+
+    monkeypatch.setattr(main, "AsyncOpenAI", fail_openai)
+    output = tmp_path / "report.json"
+    result = CliRunner().invoke(main.app, offline_evaluate_args(output))
+    assert result.exit_code == 0
+
+
+def test_evaluate_all_pass_exits_zero_and_writes_report(tmp_path: Path) -> None:
+    output = tmp_path / "report.json"
+    result = CliRunner().invoke(main.app, offline_evaluate_args(output))
+    assert result.exit_code == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["summary"]["failed_tasks"] == 0
+    assert payload["runtime_revision"] == "working-tree"
+    assert "task_set_sha256" in dict(payload["environment"])
+    assert "response_fixture_sha256" in dict(payload["environment"])
+
+
+def test_evaluate_capability_failure_exits_one_and_writes_report(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    failing_responses = tmp_path / "responses.json"
+    failing_responses.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "fixture_id": "phase-1-responses-fail",
+                "fixture_version": "v1",
+                "scripts": [
+                    {
+                        "task_id": "phase1-code-location",
+                        "responses": [{"content": "wrong answer without auth.py"}],
+                    },
+                    {
+                        "task_id": "phase1-error-explanation",
+                        "responses": [{"content": "False"}],
+                    },
+                    {
+                        "task_id": "phase1-readonly-tool-selection",
+                        "responses": [
+                            {
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call-list-1",
+                                        "name": "list_directory",
+                                        "arguments": {"path": "src"},
+                                    }
+                                ],
+                            },
+                            {"content": "src contains auth.py"},
+                        ],
+                    },
+                    {
+                        "task_id": "phase1-sensitive-file-rejection",
+                        "responses": [
+                            {
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call-env-1",
+                                        "name": "read_file",
+                                        "arguments": {"path": ".env"},
+                                    }
+                                ],
+                            },
+                            {"content": "blocked"},
+                        ],
+                    },
+                    {
+                        "task_id": "phase1-external-path-rejection",
+                        "responses": [
+                            {
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call-ext-1",
+                                        "name": "read_file",
+                                        "arguments": {"path": "C:/outside/eval-forbidden.txt"},
+                                    }
+                                ],
+                            },
+                            {"content": "blocked"},
+                        ],
+                    },
+                    {
+                        "task_id": "phase2a-planning-required",
+                        "responses": [{"content": "authenticate is in src/auth.py"}],
+                    },
+                    {
+                        "task_id": "phase2a-planning-disabled",
+                        "responses": [{"content": "src contains auth.py"}],
+                    },
+                    {
+                        "task_id": "phase2a-replan-limit",
+                        "responses": [{"content": "auth.py is in src"}],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "report.json"
+    result = CliRunner().invoke(
+        main.app,
+        [
+            "evaluate",
+            "--task-set",
+            str(TASK_SET_PATH),
+            "--responses",
+            str(failing_responses),
+            "--output",
+            str(output),
+            "--runtime-revision",
+            "working-tree",
+        ],
+    )
+    assert result.exit_code == 1
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["summary"]["failed_tasks"] >= 1
+
+
+def test_evaluate_missing_task_set_exits_two_without_overwriting_output(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "report.json"
+    output.write_text('{"stable": true}\n', encoding="utf-8")
+    result = CliRunner().invoke(
+        main.app,
+        [
+            "evaluate",
+            "--task-set",
+            str(tmp_path / "missing-tasks.json"),
+            "--responses",
+            str(RESPONSES_PATH),
+            "--output",
+            str(output),
+            "--runtime-revision",
+            "working-tree",
+        ],
+    )
+    assert result.exit_code == 2
+    assert output.read_text(encoding="utf-8") == '{"stable": true}\n'
+
+
+def test_evaluate_invalid_response_schema_exits_two(
+    tmp_path: Path,
+) -> None:
+    bad_responses = tmp_path / "bad-responses.json"
+    bad_responses.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "fixture_id": "bad",
+                "fixture_version": "v1",
+                "scripts": [
+                    {
+                        "task_id": "phase1-code-location",
+                        "responses": [{"content": None, "tool_calls": []}],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "report.json"
+    result = CliRunner().invoke(
+        main.app,
+        [
+            "evaluate",
+            "--task-set",
+            str(TASK_SET_PATH),
+            "--responses",
+            str(bad_responses),
+            "--output",
+            str(output),
+            "--runtime-revision",
+            "working-tree",
+        ],
+    )
+    assert result.exit_code == 2
+    assert not output.exists()
+
+
+def test_evaluate_duplicate_task_id_in_responses_exits_two(tmp_path: Path) -> None:
+    dup_responses = tmp_path / "dup-responses.json"
+    dup_responses.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "fixture_id": "dup",
+                "fixture_version": "v1",
+                "scripts": [
+                    {"task_id": "phase1-code-location", "responses": [{"content": "ok"}]},
+                    {"task_id": "phase1-code-location", "responses": [{"content": "ok"}]},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "report.json"
+    result = CliRunner().invoke(
+        main.app,
+        [
+            "evaluate",
+            "--task-set",
+            str(TASK_SET_PATH),
+            "--responses",
+            str(dup_responses),
+            "--output",
+            str(output),
+            "--runtime-revision",
+            "working-tree",
+        ],
+    )
+    assert result.exit_code == 2
+
+
+def test_evaluate_exhausted_response_script_exits_two(tmp_path: Path) -> None:
+    exhausted = tmp_path / "exhausted.json"
+    exhausted.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "fixture_id": "exhausted",
+                "fixture_version": "v1",
+                "scripts": [
+                    {
+                        "task_id": "phase1-code-location",
+                        "responses": [
+                            {
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call-1",
+                                        "name": "search_text",
+                                        "arguments": {"query": "authenticate", "path": "."},
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {"task_id": "phase1-error-explanation", "responses": [{"content": "False"}]},
+                    {
+                        "task_id": "phase1-readonly-tool-selection",
+                        "responses": [
+                            {
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call-list-1",
+                                        "name": "list_directory",
+                                        "arguments": {"path": "src"},
+                                    }
+                                ],
+                            },
+                            {"content": "src contains auth.py"},
+                        ],
+                    },
+                    {
+                        "task_id": "phase1-sensitive-file-rejection",
+                        "responses": [
+                            {
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call-env-1",
+                                        "name": "read_file",
+                                        "arguments": {"path": ".env"},
+                                    }
+                                ],
+                            },
+                            {"content": "blocked"},
+                        ],
+                    },
+                    {
+                        "task_id": "phase1-external-path-rejection",
+                        "responses": [
+                            {
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call-ext-1",
+                                        "name": "read_file",
+                                        "arguments": {"path": "C:/outside/eval-forbidden.txt"},
+                                    }
+                                ],
+                            },
+                            {"content": "blocked"},
+                        ],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "report.json"
+    result = CliRunner().invoke(
+        main.app,
+        [
+            "evaluate",
+            "--task-set",
+            str(TASK_SET_PATH),
+            "--responses",
+            str(exhausted),
+            "--output",
+            str(output),
+            "--runtime-revision",
+            "working-tree",
+        ],
+    )
+    assert result.exit_code == 2
+
+
+def test_evaluate_only_reads_sample_project_fixture(tmp_path: Path) -> None:
+    output = tmp_path / "report.json"
+    result = CliRunner().invoke(main.app, offline_evaluate_args(output))
+    assert result.exit_code == 0
+    assert SAMPLE_PROJECT_PATH.is_dir()
