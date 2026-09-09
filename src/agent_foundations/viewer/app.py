@@ -8,7 +8,13 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from agent_foundations.chat.api import ChatServices, create_chat_router
+from agent_foundations.chat.lifecycle import (
+    log_sse_cancelled,
+    log_sse_failed,
+    mark_lifespan_shutdown,
+)
 from agent_foundations.chat.repository import ConversationRepository
+from agent_foundations.command_output.retention import ArtifactRetentionSweeper
 from agent_foundations.runtime.replay import TraceReplayError, list_sessions, load_trace
 from agent_foundations.runtime.trace import TraceEvent
 from agent_foundations.viewer.navigation import TraceNavigation, build_trace_navigation
@@ -16,6 +22,20 @@ from agent_foundations.viewer.stream import EventBroker, encode_sse
 
 STATIC_DIR = Path(__file__).parent / "static"
 CHAT_BUILD_DIR = STATIC_DIR / "chat"
+
+
+def _sync_artifact_sweep(retention: ArtifactRetentionSweeper) -> None:
+    retention.sweep_expired()
+    retention.sweep_pending_delete()
+
+
+async def _periodic_artifact_sweep(
+    retention: ArtifactRetentionSweeper,
+    interval: float,
+) -> None:
+    while True:
+        await asyncio.sleep(interval)
+        await asyncio.to_thread(_sync_artifact_sweep, retention)
 
 
 def create_app(
@@ -37,11 +57,28 @@ def create_app(
 
     @asynccontextmanager
     async def chat_lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        _app.state.chat_shutting_down = False
         await services.repository.initialize()
-        await services.repository.interrupt_unfinished()
+        await services.repository.interrupt_unfinished(
+            durable_repository=services.durable_repository,
+        )
+        sweep_task: asyncio.Task[None] | None = None
         try:
+            retention = services.retention
+            if retention is not None:
+                await asyncio.to_thread(_sync_artifact_sweep, retention)
+                interval = services.artifact_sweep_interval_seconds
+                if interval > 0:
+                    sweep_task = asyncio.create_task(
+                        _periodic_artifact_sweep(retention, interval),
+                    )
             yield
         finally:
+            mark_lifespan_shutdown(_app)
+            if sweep_task is not None:
+                sweep_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await sweep_task
             try:
                 await services.coordinator.shutdown()
             finally:
@@ -107,6 +144,7 @@ def _register_trace_api(
         async def generate() -> AsyncIterator[str]:
             subscription = event_broker.subscribe(session_id)
             next_event: asyncio.Task[TraceEvent] | None = None
+            disconnect_logged = False
             try:
                 yield ": connected\n\n"
                 next_event = asyncio.create_task(anext(subscription))
@@ -121,6 +159,16 @@ def _register_trace_api(
                         break
                     yield encode_sse(event)
                     next_event = asyncio.create_task(anext(subscription))
+                else:
+                    log_sse_cancelled(request, "trace")
+                    disconnect_logged = True
+            except asyncio.CancelledError:
+                if not disconnect_logged:
+                    log_sse_cancelled(request, "trace")
+                return
+            except Exception as exc:
+                log_sse_failed(exc, "trace")
+                raise
             finally:
                 if next_event is not None and not next_event.done():
                     next_event.cancel()

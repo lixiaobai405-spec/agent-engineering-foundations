@@ -5,14 +5,19 @@ const MAX_COMPOSER_HEIGHT = 144;
 export function ChatComposer({
   disabled,
   disabledReason,
+  stopEnabled = false,
+  onStop,
   onSubmit,
 }: {
   disabled: boolean;
   disabledReason?: string | null;
+  stopEnabled?: boolean;
+  onStop?: () => Promise<void>;
   onSubmit: (query: string) => Promise<void>;
 }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   function resizeTextarea(textarea: HTMLTextAreaElement): void {
@@ -41,6 +46,18 @@ export function ChatComposer({
     }
   }
 
+  async function handleStop(): Promise<void> {
+    if (!stopEnabled || stopping || onStop === undefined) {
+      return;
+    }
+    setStopping(true);
+    try {
+      await onStop();
+    } finally {
+      setStopping(false);
+    }
+  }
+
   const isDisabled = disabled || submitting;
 
   return (
@@ -62,6 +79,17 @@ export function ChatComposer({
           placeholder="Message Agent…"
           rows={1}
         />
+        {stopEnabled ? (
+          <button
+            type="button"
+            className="chat-composer__stop"
+            aria-label="Stop"
+            disabled={stopping}
+            onClick={() => void handleStop()}
+          >
+            Stop
+          </button>
+        ) : null}
         <button type="submit" aria-label="Send message" disabled={isDisabled}>
           Send
         </button>

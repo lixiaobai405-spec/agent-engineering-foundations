@@ -162,6 +162,37 @@ def test_trace_to_chat_maps_supported_trace_events(
     assert chat_event.type is chat_type
 
 
+def test_plan_trace_events_project_to_plan_updated_without_evidence(
+    projector: Any,
+) -> None:
+    payload = {
+        "plan_id": "plan-1",
+        "version": 1,
+        "goal": "inspect the fixture project",
+        "replan_count": 0,
+        "max_replans": 2,
+        "steps": [
+            {
+                "step_id": "read",
+                "status": "pending",
+                "description": "list project files",
+            },
+        ],
+        "evidence_refs": ["should-not-appear"],
+    }
+    for trace_type in ("plan.created", "plan.step.updated", "plan.replanned"):
+        chat_event = projector.project(
+            _make_trace_event(event_type=trace_type, status="completed", payload=payload),
+        )
+        assert chat_event is not None
+        assert chat_event.type.value == "plan.updated"
+        dumped = chat_event.model_dump_json()
+        assert "should-not-appear" not in dumped
+        assert chat_event.data["plan_id"] == "plan-1"
+        assert chat_event.data["goal"] == "inspect the fixture project"
+        assert chat_event.data["steps"][0]["step_id"] == "read"
+
+
 @pytest.mark.parametrize(
     "trace_type",
     [

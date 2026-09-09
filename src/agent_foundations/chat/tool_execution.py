@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -11,13 +12,17 @@ from agent_foundations.chat.models import (
     ApprovalRequest,
     ApprovalStatus,
     Conversation,
-    PermissionMode,
     PolicyDecision,
     ResourceKind,
+    utc_now,
 )
 from agent_foundations.domain.errors import PathPolicyViolationError
 from agent_foundations.domain.tool import Tool, ToolResult
-from agent_foundations.runtime.tool_execution import ToolExecutionContext
+from agent_foundations.runtime.tool_execution import ToolCallExecutor, ToolExecutionContext
+from agent_foundations.security.approvals import (
+    AuthorizationDecision,
+    AuthorizationStatus,
+)
 from agent_foundations.security.models import (
     PermissionProfile,
     PermissionProfileName,
@@ -25,9 +30,14 @@ from agent_foundations.security.models import (
     PolicyRequest,
     PolicyResource,
     ResourceScope,
+    ToolManifest,
     default_allowed_tools,
 )
 from agent_foundations.security.policy import PolicyEngine
+from agent_foundations.tools.command.run_command import (
+    RUN_COMMAND_MANIFEST,
+    resolve_run_command_resource,
+)
 from agent_foundations.tools.filesystem.list_directory import (
     LIST_DIRECTORY_MANIFEST,
     ListDirectoryTool,
@@ -38,6 +48,11 @@ from agent_foundations.tools.filesystem.search_text import (
     SEARCH_TEXT_MANIFEST,
     SearchTextTool,
 )
+from agent_foundations.tools.patch.apply_patch import (
+    APPLY_PATCH_MANIFEST,
+    ApplyPatchTool,
+    resolve_apply_patch_resource,
+)
 
 _EXTERNAL_READ_TOOLS = frozenset({"read_file", "list_directory", "search_text"})
 _EXTERNAL_POLICY_METADATA = {
@@ -45,6 +60,170 @@ _EXTERNAL_POLICY_METADATA = {
     "list_directory": (LIST_DIRECTORY_MANIFEST, "list"),
     "search_text": (SEARCH_TEXT_MANIFEST, "search"),
 }
+
+ControlledPatchFactory = Callable[
+    [Callable[[AuthorizationDecision], AuthorizationDecision] | None],
+    ToolCallExecutor,
+]
+
+
+class ChatControlledToolExecutor:
+    """Bridge persisted Chat approval to the controlled patch executor."""
+
+    def __init__(
+        self,
+        downstream: ToolCallExecutor,
+        conversation: Conversation,
+        coordinator: ApprovalCoordinator,
+        controlled_patch_factory: ControlledPatchFactory,
+        *,
+        controlled_command_factory: ControlledPatchFactory | None = None,
+        output_executor: ToolCallExecutor | None = None,
+    ) -> None:
+        self._downstream = downstream
+        self._conversation = conversation
+        self._coordinator = coordinator
+        self._controlled_patch_factory = controlled_patch_factory
+        self._controlled_command_factory = controlled_command_factory
+        self._output_executor = output_executor
+
+    async def execute(
+        self,
+        tool: Tool,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        from agent_foundations.tools.command.read_output import ReadCommandOutputTool
+        from agent_foundations.tools.command.run_command import RunCommandTool
+        from agent_foundations.tools.command.search_output import SearchCommandOutputTool
+
+        if isinstance(tool, (ReadCommandOutputTool, SearchCommandOutputTool)):
+            if self._output_executor is None:
+                return await tool.execute(arguments)
+            return await self._output_executor.execute(tool, arguments, context)
+
+        if isinstance(tool, RunCommandTool):
+            if self._controlled_command_factory is None:
+                return await tool.execute(arguments)
+            initial = await self._controlled_command_factory(None).execute(
+                tool,
+                arguments,
+                context,
+            )
+            if initial.error_code != "APPROVAL_REQUIRED":
+                return initial
+            request = ApprovalRequest(
+                conversation_id=self._conversation.conversation_id,
+                session_id=context.session_id,
+                tool_call_id=context.tool_call_id,
+                tool_name="run_command",
+                canonical_path="command:run_command",
+                operation=AccessOperation.READ,
+            )
+            policy_request, outcome = self._manifest_policy_request(
+                context,
+                tool_name="run_command",
+                manifest=RUN_COMMAND_MANIFEST,
+                resource=resolve_run_command_resource(arguments),
+                operation="run",
+            )
+            status = await self._coordinator.request(request, policy_request, outcome)
+
+            def decide_command(pending: AuthorizationDecision) -> AuthorizationDecision:
+                target = (
+                    AuthorizationStatus.APPROVED
+                    if status is ApprovalStatus.APPROVED
+                    else AuthorizationStatus.DENIED
+                )
+                return pending.model_copy(
+                    update={"status": target, "decided_at": utc_now()},
+                )
+
+            return await self._controlled_command_factory(decide_command).execute(
+                tool,
+                arguments,
+                context,
+            )
+
+        if not isinstance(tool, ApplyPatchTool):
+            return await self._downstream.execute(tool, arguments, context)
+
+        initial = await self._controlled_patch_factory(None).execute(
+            tool,
+            arguments,
+            context,
+        )
+        if initial.error_code != "APPROVAL_REQUIRED":
+            return initial
+
+        patch_id = str(arguments.get("patch_id", ""))
+        request = ApprovalRequest(
+            conversation_id=self._conversation.conversation_id,
+            session_id=context.session_id,
+            tool_call_id=context.tool_call_id,
+            tool_name="apply_patch",
+            canonical_path=f"patch:{patch_id}",
+            operation=AccessOperation.APPLY,
+        )
+        try:
+            resource = resolve_apply_patch_resource(arguments)
+        except ValueError:
+            resource = PolicyResource(
+                kind=APPLY_PATCH_MANIFEST.resource_kind,
+                scope=ResourceScope.PROJECT_INTERNAL,
+                identifier=(f"patch:{patch_id}" if patch_id else "project_path")[:256],
+            )
+        policy_request, outcome = self._manifest_policy_request(
+            context,
+            tool_name="apply_patch",
+            manifest=APPLY_PATCH_MANIFEST,
+            resource=resource,
+            operation="apply",
+        )
+        status = await self._coordinator.request(request, policy_request, outcome)
+
+        def decide(pending: AuthorizationDecision) -> AuthorizationDecision:
+            target = (
+                AuthorizationStatus.APPROVED
+                if status is ApprovalStatus.APPROVED
+                else AuthorizationStatus.DENIED
+            )
+            return pending.model_copy(
+                update={"status": target, "decided_at": utc_now()},
+            )
+
+        return await self._controlled_patch_factory(decide).execute(
+            tool,
+            arguments,
+            context,
+        )
+
+    def _manifest_policy_request(
+        self,
+        context: ToolExecutionContext,
+        *,
+        tool_name: str,
+        manifest: ToolManifest,
+        resource: PolicyResource,
+        operation: str,
+    ) -> tuple[PolicyRequest, PolicyOutcome]:
+        profile = PermissionProfile(
+            name=self._conversation.permission_profile,
+            version=self._conversation.profile_version,
+            allowed_tools=default_allowed_tools(
+                self._conversation.permission_profile,
+            ),
+        )
+        policy_request = PolicyRequest(
+            profile_version=profile.version,
+            run_id=context.session_id,
+            tool_call_id=context.tool_call_id,
+            tool_name=tool_name,
+            manifest=manifest,
+            resource=resource,
+            operation=operation,
+        )
+        return policy_request, PolicyEngine().decide(profile, policy_request)
 
 
 class FilesystemAccessController:
@@ -69,7 +248,7 @@ class FilesystemAccessController:
             scope = AccessScope.EXTERNAL_EXACT_PATH
             decision = (
                 PolicyDecision.ASK
-                if conversation.permission_mode is PermissionMode.ASK_FOR_ACCESS
+                if conversation.permission_profile is PermissionProfileName.ASK_ALWAYS
                 else PolicyDecision.DENY
             )
         return AccessDecision(
@@ -132,7 +311,11 @@ class ApprovalAwareToolExecutor:
         request_capability = getattr(self._coordinator, "request_capability", None)
         capability = None
         if request_capability is None:
-            approval_status = await self._coordinator.request(request)
+            approval_status = await self._coordinator.request(
+                request,
+                policy_request,
+                outcome,
+            )
         else:
             capability = await request_capability(request, policy_request, outcome)
             approval_status = (
@@ -209,8 +392,8 @@ class ApprovalAwareToolExecutor:
             return SearchTextTool(policy), rewritten
         raise PathPolicyViolationError("tool cannot receive external read access")
 
-    @staticmethod
     def _external_policy_request(
+        self,
         tool_name: str,
         context: ToolExecutionContext,
         canonical_path: str,
@@ -220,9 +403,11 @@ class ApprovalAwareToolExecutor:
             raise PathPolicyViolationError("tool cannot receive external read access")
         manifest, operation = metadata
         profile = PermissionProfile(
-            name=PermissionProfileName.ASK_ALWAYS,
-            version=1,
-            allowed_tools=default_allowed_tools(PermissionProfileName.ASK_ALWAYS),
+            name=self._conversation.permission_profile,
+            version=self._conversation.profile_version,
+            allowed_tools=default_allowed_tools(
+                self._conversation.permission_profile,
+            ),
         )
         request = PolicyRequest(
             profile_version=profile.version,

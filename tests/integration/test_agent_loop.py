@@ -7,6 +7,7 @@ import pytest
 
 from agent_foundations.context.budget import ContextBudget
 from agent_foundations.context.builder import ContextBuilder
+from agent_foundations.domain._freeze import to_json_value
 from agent_foundations.domain.errors import (
     ContextBudgetExceededError,
     FakeModelExhaustedError,
@@ -95,6 +96,34 @@ def build_loop(
 
 
 @pytest.mark.asyncio
+async def test_context_snapshot_records_selection_without_source_body() -> None:
+    loop, sink, _ = build_loop(
+        [ModelResponse(content="The authenticate helper lives in src/auth.py.")],
+    )
+    result = await loop.run(FIXTURE_ROOT, "Where is authenticate defined?")
+    assert "authenticate" in result.answer.casefold()
+    snapshots = [event for event in sink.events if event.event_type == "context.snapshot"]
+    assert snapshots, "context.snapshot event is missing"
+    payload = to_json_value(snapshots[0].payload)
+    dumped = json.dumps(payload)
+    assert "def authenticate" not in dumped
+    assert "demo-token" not in dumped
+    assert "compaction" not in dumped.casefold()
+    sources = payload.get("sources")
+    assert isinstance(sources, list)
+    assert sources
+    sample = sources[0]
+    assert isinstance(sample, dict)
+    assert {"source_id", "kind", "provenance", "fingerprint", "chars", "score", "decision"} <= set(
+        sample,
+    )
+    assert "content" not in sample
+    assert sample["decision"] in {"selected", "dropped"}
+    assert "cache" in payload
+    assert payload["cache"] in {"hit", "miss", "mixed", "none"}
+
+
+@pytest.mark.asyncio
 async def test_agent_executes_tool_then_returns_final_answer() -> None:
     loop, sink, provider = build_loop([
         ModelResponse(
@@ -108,14 +137,28 @@ async def test_agent_executes_tool_then_returns_final_answer() -> None:
     assert result.answer.startswith("The project")
     assert result.steps == 2
     assert len(provider.requests) == 2
+    from uuid import uuid5
+
+    from agent_foundations.runtime.state_machine import AgentRunPhase
+
+    first = provider.requests[0]
+    assert first.run_id is not None
+    assert first.request_id == uuid5(
+        first.run_id,
+        f"model:1:{AgentRunPhase.READY_FOR_MODEL.value}",
+    )
+    assert provider.requests[1].request_id != first.request_id
+    assert provider.requests[1].run_id == first.run_id
     assert [event.event_type for event in sink.events] == [
         "session.started",
         "user.message",
+        "context.snapshot",
         "model.request.started",
         "model.response.received",
         "tool.call.requested",
         "tool.call.validated",
         "tool.call.completed",
+        "context.snapshot",
         "model.request.started",
         "model.response.received",
         "agent.final_answer",
@@ -237,8 +280,24 @@ def test_agent_config_rejects_non_positive_max_steps() -> None:
 # ── Provider error regression tests ───────────────────────────────────────
 
 
-class InvalidRawResponseProvider:
-    """A ModelProvider that raises InvalidModelResponseError with non-JSON-safe data."""
+class OnceInvalidThenAnswerProvider:
+    """Raises InvalidModelResponseError once, then returns a final answer."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        self.calls += 1
+        if self.calls == 1:
+            raise InvalidModelResponseError(
+                "invalid response",
+                raw_response={"raw": b"bytes"},
+            )
+        return ModelResponse(content="recovered answer")
+
+
+class AlwaysInvalidRawResponseProvider:
+    """Always raises InvalidModelResponseError with non-JSON-safe data."""
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         raise InvalidModelResponseError(
@@ -271,17 +330,85 @@ def build_loop_with_provider(
 
 @pytest.mark.asyncio
 async def test_invalid_provider_raw_response_does_not_mask_original_error() -> None:
-    """Non-JSON-safe raw_response must not hide the original ProviderError."""
-    loop, sink = build_loop_with_provider(InvalidRawResponseProvider())
+    """Bytes raw_response stays omitted; first invalid completion must not fail the session."""
+    loop, sink = build_loop_with_provider(OnceInvalidThenAnswerProvider())
 
-    with pytest.raises(InvalidModelResponseError) as exc_info:
+    result = await loop.run(FIXTURE_ROOT, "inspect")
+
+    assert "recovered answer" in result.answer
+    failed = [event for event in sink.events if event.event_type == "session.failed"]
+    assert failed == []
+    invalid = [
+        event for event in sink.events if event.event_type == "model.response.invalid"
+    ]
+    assert invalid, "model.response.invalid event is missing"
+    assert invalid[0].payload["error"] == "InvalidModelResponseError"
+    assert invalid[0].payload["raw_response"] == {"omitted": "non_json_safe"}
+    request_events = [
+        event for event in sink.events if event.event_type == "model.request.started"
+    ]
+    assert len(request_events) >= 2
+    follow_up_context = json.dumps(to_json_value(request_events[1].payload))
+    assert "INVALID_MODEL_RESPONSE" in follow_up_context
+
+
+@pytest.mark.asyncio
+async def test_persistent_invalid_model_response_stops_at_max_steps() -> None:
+    loop, sink = build_loop_with_provider(
+        AlwaysInvalidRawResponseProvider(),
+        max_steps=2,
+    )
+
+    with pytest.raises(MaxStepsExceededError):
         await loop.run(FIXTURE_ROOT, "inspect")
 
-    assert str(exc_info.value) == "invalid response"
+    failed = [event for event in sink.events if event.event_type == "session.failed"]
+    assert failed
+    assert failed[-1].payload.get("error") != "InvalidModelResponseError"
+    invalid = [
+        event for event in sink.events if event.event_type == "model.response.invalid"
+    ]
+    assert len(invalid) == 2
 
-    assert sink.events[-1].event_type == "session.failed"
-    assert sink.events[-1].payload["error"] == "InvalidModelResponseError"
-    assert sink.events[-1].payload["raw_response"] == {"omitted": "non_json_safe"}
+
+@pytest.mark.asyncio
+async def test_argument_parse_error_is_tool_failure_without_execute() -> None:
+    spy = SpyToolCallExecutor()
+    parse_error = (
+        "validate_patch: JSONDecodeError: Expecting ',' delimiter: line 1 column 10 "
+        "(char 9) at pos 9 near '{\"diff\": @}'. Repair the JSON and call the same "
+        "tool again; do not resend the identical broken string."
+    )
+    loop, sink, _provider = build_loop(
+        [
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        id="c-bad",
+                        name="validate_patch",
+                        arguments={},
+                        argument_parse_error=parse_error,
+                    ),
+                ),
+            ),
+            ModelResponse(content="patched after repair"),
+        ],
+        tool_executor=spy,
+    )
+
+    result = await loop.run(FIXTURE_ROOT, "inspect")
+
+    assert "patched after repair" in result.answer
+    assert spy.calls == []
+    failed = [event for event in sink.events if event.event_type == "tool.call.failed"]
+    assert failed
+    assert failed[0].payload["result"]["error_code"] == "INVALID_TOOL_JSON"
+    assert parse_error in str(failed[0].payload["result"]["content"])
+    validated = [
+        event for event in sink.events if event.event_type == "tool.call.validated"
+    ]
+    assert validated == []
+    assert all(event.event_type != "session.failed" for event in sink.events)
 
 
 @pytest.mark.asyncio
@@ -316,12 +443,13 @@ async def test_run_includes_visible_history_and_fixed_session_id() -> None:
     )
 
     assert result.session_id == session_id
-    assert [message.content for message in provider.requests[0].messages] == [
-        AgentConfig().system_prompt,
-        "old question",
-        "old answer",
-        "new question",
-    ]
+    contents = [message.content for message in provider.requests[0].messages]
+    assert contents[0] == AgentConfig().system_prompt
+    assert any(
+        isinstance(item, str) and item.startswith("[repository context]")
+        for item in contents
+    )
+    assert contents[-3:] == ["old question", "old answer", "new question"]
     assert {event.session_id for event in sink.events} == {session_id}
     user_message_events = [
         event for event in sink.events if event.event_type == "user.message"

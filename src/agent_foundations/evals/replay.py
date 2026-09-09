@@ -18,21 +18,42 @@ from agent_foundations.domain.model import ModelResponse
 from agent_foundations.evals.models import EvalTask, EvalTaskSet
 from agent_foundations.evals.reporting import EvalReport
 from agent_foundations.evals.runner import EvalObservation, OfflineEvalRunner
+from agent_foundations.execution.fake import FakeBackend
+from agent_foundations.execution.models import ExecutionRequest, ExecutionResult
 from agent_foundations.planning.controller import PlanController
 from agent_foundations.planning.execution import ExecutionFactJournal
 from agent_foundations.planning.tools import PlanningToolExecutor, build_planning_tools
 from agent_foundations.providers.fake import FakeModelProvider
 from agent_foundations.runtime.agent import AgentConfig, PlanningMode
 from agent_foundations.runtime.loop import AgentLoop
+from agent_foundations.runtime.redaction import Redactor
 from agent_foundations.runtime.tool_execution import DirectToolCallExecutor
 from agent_foundations.runtime.trace import InMemoryEventSink
 from agent_foundations.tools.filesystem.path_policy import PathPolicy
-from agent_foundations.tools.registry import ToolRegistry, build_replay_registered_tools
+from agent_foundations.tools.git.service import GitReadService
+from agent_foundations.tools.patch.apply_patch import build_apply_patch_registered_tool
+from agent_foundations.tools.registry import (
+    ToolRegistry,
+    build_git_read_registered_tools,
+    build_replay_registered_tools,
+    build_standard_registered_tools,
+)
 
 PHASE1_PROMPT_VERSION = "phase-1-v1"
+PHASE2_PROMPT_VERSION = "phase-2-v1"
 READONLY_TOOL_SET: tuple[str, ...] = ("list_directory", "read_file", "search_text")
 PLANNING_TOOL_SET: tuple[str, ...] = ("set_plan", "update_plan_step", "replan")
 PHASE2A_TOOL_SET: tuple[str, ...] = READONLY_TOOL_SET + PLANNING_TOOL_SET
+PHASE2_CODING_TOOL_SET: tuple[str, ...] = PHASE2A_TOOL_SET + (
+    "validate_patch",
+    "apply_patch",
+    "run_command",
+    "git_status",
+    "git_diff",
+    "git_log",
+)
+PHASE2_CODING_DATASET_ID = "phase-2-coding"
+PHASE2_CODING_TAG = "phase-2-coding"
 
 
 class EvalInputError(Exception):
@@ -62,9 +83,77 @@ class ResponseFixture(ValidatedCopyModel):
 
 
 def tool_set_for_task_set(task_set: EvalTaskSet) -> tuple[str, ...]:
+    if task_set.dataset_id == PHASE2_CODING_DATASET_ID:
+        return PHASE2_CODING_TOOL_SET
     if any("planning-required" in task.tags for task in task_set.tasks):
         return PHASE2A_TOOL_SET
     return READONLY_TOOL_SET
+
+
+def prompt_version_for_task_set(task_set: EvalTaskSet) -> str:
+    if task_set.dataset_id == PHASE2_CODING_DATASET_ID:
+        return PHASE2_PROMPT_VERSION
+    return PHASE1_PROMPT_VERSION
+
+
+def _fake_git_backend_factory(project_root: Path) -> FakeBackend:
+    del project_root
+
+    def factory(request: ExecutionRequest) -> ExecutionResult:
+        stdout = b""
+        if "status" in request.argv:
+            stdout = b" M tests/test_fail.py\0"
+        elif "diff" in request.argv:
+            stdout = (
+                b"diff --git a/tests/test_fail.py b/tests/test_fail.py\n"
+                b"--- a/tests/test_fail.py\n"
+                b"+++ b/tests/test_fail.py\n"
+            )
+        elif "log" in request.argv:
+            stdout = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tfixture\n"
+        return ExecutionResult(
+            execution_id=request.execution_id,
+            exit_code=0,
+            stdout=stdout,
+            stderr=b"",
+            timed_out=False,
+            cancelled=False,
+            output_truncated=False,
+        )
+
+    return FakeBackend(result_factory=factory)
+
+
+def build_phase2_coding_replay_registry(
+    project_root: Path,
+    *,
+    planning_required: bool,
+    controller: PlanController,
+    journal: ExecutionFactJournal,
+) -> ToolRegistry:
+    policy = PathPolicy(project_root)
+    registered = list(
+        build_standard_registered_tools(
+            policy,
+            controller=controller if planning_required else None,
+            journal=journal if planning_required else None,
+            include_validate_patch=True,
+        ),
+    )
+    registered.append(build_apply_patch_registered_tool())
+    from agent_foundations.tools.command.run_command import (
+        build_run_command_registered_tool,
+    )
+
+    registered.append(build_run_command_registered_tool())
+    service = GitReadService(
+        project_root,
+        _fake_git_backend_factory(project_root),
+        policy,
+        Redactor(project_root),
+    )
+    registered.extend(build_git_read_registered_tools(service, policy))
+    return ToolRegistry(tuple(registered))
 
 
 def build_replay_registry(
@@ -193,18 +282,25 @@ class ReplayEvalAgent:
         provider = FakeModelProvider(responses)
         sink = InMemoryEventSink()
         planning_required = "planning-required" in task.tags
+        coding = PHASE2_CODING_TAG in task.tags
         controller = PlanController()
         journal = ExecutionFactJournal()
-        registry = (
-            build_replay_registry(
+        if coding:
+            registry = build_phase2_coding_replay_registry(
                 project_root,
                 planning_required=planning_required,
                 controller=controller,
                 journal=journal,
             )
-            if planning_required
-            else self._registry_factory(project_root)
-        )
+        elif planning_required:
+            registry = build_replay_registry(
+                project_root,
+                planning_required=planning_required,
+                controller=controller,
+                journal=journal,
+            )
+        else:
+            registry = self._registry_factory(project_root)
         tool_executor = build_replay_tool_executor(
             planning_required,
             controller,
@@ -257,7 +353,7 @@ async def run_offline_evaluate(
     agent = ReplayEvalAgent(scripts, registry_factory=registry_factory)
     runner = OfflineEvalRunner(
         fixture_root=fixture_root,
-        prompt_version=PHASE1_PROMPT_VERSION,
+        prompt_version=prompt_version_for_task_set(task_set),
         response_fixture_version=response_fixture.fixture_version,
         tool_set=tool_set_for_task_set(task_set),
         runtime_revision=runtime_revision,

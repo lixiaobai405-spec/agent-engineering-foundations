@@ -30,7 +30,8 @@ def validate_migration_sequence(
 
 
 def get_application_migrations() -> tuple[Migration, ...]:
-    from agent_foundations.chat.schema import CHAT_MIGRATIONS
+    from agent_foundations.chat.schema import CHAT_MIGRATIONS, PERMISSION_PROFILE_MIGRATION
+    from agent_foundations.command_output.schema import COMMAND_OUTPUT_MIGRATIONS
     from agent_foundations.durable.schema import DURABLE_MIGRATIONS
     from agent_foundations.security.schema import AUTHORIZATION_MIGRATIONS
     from agent_foundations.tools.patch.schema import PATCH_MIGRATIONS
@@ -41,5 +42,7 @@ def get_application_migrations() -> tuple[Migration, ...]:
             *DURABLE_MIGRATIONS,
             *PATCH_MIGRATIONS,
             *AUTHORIZATION_MIGRATIONS,
+            PERMISSION_PROFILE_MIGRATION,
+            *COMMAND_OUTPUT_MIGRATIONS,
         ),
     )

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import socket
+import sqlite3
 import threading
 import time
 from collections.abc import Iterator
@@ -26,12 +28,19 @@ from agent_foundations.context.builder import ContextBuilder
 from agent_foundations.domain.errors import FakeModelExhaustedError
 from agent_foundations.domain.model import ModelRequest, ModelResponse
 from agent_foundations.domain.tool import ToolCall
+from agent_foundations.execution.models import ExecutionResult
 from agent_foundations.providers.fake import FakeModelProvider
 from agent_foundations.runtime.agent import AgentConfig
 from agent_foundations.runtime.loop import AgentLoop
 from agent_foundations.runtime.redaction import Redactor
 from agent_foundations.runtime.tool_execution import ToolCallExecutor
 from agent_foundations.runtime.trace import EventSink
+from agent_foundations.tools.patch.applier import (
+    apply_prepared_patch_atomically,
+    prepare_patch,
+)
+from agent_foundations.tools.patch.models import BaselineEntry
+from agent_foundations.tools.patch.validator import parse_and_validate_patch
 from agent_foundations.viewer.app import CHAT_BUILD_DIR, create_app
 from tests.unit.tools.registry_helpers import readonly_tool_registry
 
@@ -118,6 +127,12 @@ def _build_chat_app(
     broker = RecordingBroker()
     supervisor = RunSupervisor()
     coordinator = ApprovalCoordinator(repository, broker)
+    from agent_foundations.command_output.access import CommandOutputDownloadTicketStore
+    from agent_foundations.command_output.repository import CommandArtifactRepository
+    from agent_foundations.command_output.store import CommandArtifactStore
+
+    artifacts = CommandArtifactRepository.from_path(database_path)
+    store = CommandArtifactStore(tmp_path / "artifacts", repository=artifacts)
 
     def runtime_factory(
         conversation: Any,
@@ -150,6 +165,9 @@ def _build_chat_app(
         runner=runner,
         supervisor=supervisor,
         coordinator=coordinator,
+        command_artifact_store=store,
+        command_artifact_repository=artifacts,
+        command_output_tickets=CommandOutputDownloadTicketStore(),
     )
     return create_app(tmp_path / "traces", chat_services=services), repository, broker
 
@@ -190,7 +208,10 @@ def _create_conversation_ui(
     page.get_by_role("button", name="New conversation").click()
     page.get_by_label("Title").fill(title)
     page.get_by_label("Project root").fill(str(project_root))
-    page.get_by_label("Permission mode").select_option(permission_mode)
+    permission_profile = (
+        "ASK_ALWAYS" if permission_mode == "ASK_FOR_ACCESS" else permission_mode
+    )
+    page.get_by_label("Permission profile").select_option(permission_profile)
     page.get_by_role("button", name="Create conversation").click()
     expect(page.get_by_role("heading", level=1, name=title)).to_be_visible()
 
@@ -445,7 +466,9 @@ def test_chat_reload_during_running_recovers_before_completion(
         expect(browser_page.get_by_role("button", name="Send message")).to_be_disabled(
             timeout=15_000,
         )
-        expect(browser_page.get_by_label("Permission mode")).to_be_disabled(timeout=15_000)
+        expect(browser_page.get_by_label("Permission profile")).to_be_disabled(
+            timeout=15_000,
+        )
         release.set()
         expect(browser_page.get_by_text("Recovered running answer")).to_be_visible(
             timeout=15_000,
@@ -642,7 +665,7 @@ def test_chat_reload_waiting_approval_reconstructs_card(
             card.locator(".approval-card__meta").get_by_text("external exact path"),
         ).to_be_visible()
         expect(browser_page.get_by_role("button", name="Send message")).to_be_disabled()
-        expect(browser_page.get_by_label("Permission mode")).to_be_disabled()
+        expect(browser_page.get_by_label("Permission profile")).to_be_disabled()
 
         browser_page.reload()
         browser_page.wait_for_load_state("networkidle")
@@ -661,7 +684,7 @@ def test_chat_reload_waiting_approval_reconstructs_card(
             reloaded_card.locator(".approval-card__meta").get_by_text("external exact path"),
         ).to_be_visible()
         expect(browser_page.get_by_role("button", name="Send message")).to_be_disabled()
-        expect(browser_page.get_by_label("Permission mode")).to_be_disabled()
+        expect(browser_page.get_by_label("Permission profile")).to_be_disabled()
         with browser_page.expect_request(
             lambda request: (
                 request.method == "POST"
@@ -758,3 +781,362 @@ def test_chat_service_restart_invalidates_waiting_approval(
         assert response.status in {409, 404}
     finally:
         _stop_server(server2, thread2)
+
+
+def test_task16_browser_patch_profile_reload_approve_deny_and_no_duplicate_write(
+    tmp_path: Path,
+    browser_page: Page,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_foundations.cli import main
+
+    project = tmp_path / "controlled-project"
+    project.mkdir()
+    readme = project / "README.md"
+    readme.write_text("before\n", encoding="utf-8", newline="\n")
+    before_sha = hashlib.sha256(readme.read_bytes()).hexdigest()
+    approved_sha = hashlib.sha256(b"approved\n").hexdigest()
+    approved_diff = """diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1 @@
+-before
++approved
+"""
+    denied_diff = """diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1 @@
+-approved
++denied
+"""
+    approved_patch = parse_and_validate_patch(
+        approved_diff,
+        (BaselineEntry(path="README.md", sha256=before_sha),),
+        project,
+    )
+    readme.write_text("approved\n", encoding="utf-8", newline="\n")
+    denied_patch = parse_and_validate_patch(
+        denied_diff,
+        (BaselineEntry(path="README.md", sha256=approved_sha),),
+        project,
+    )
+    readme.write_text("before\n", encoding="utf-8", newline="\n")
+    provider = FakeModelProvider(
+        [
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        id="browser-validate-approved",
+                        name="validate_patch",
+                        arguments={
+                            "diff": approved_diff,
+                            "baselines": [{"path": "README.md", "sha256": before_sha}],
+                        },
+                    ),
+                ),
+            ),
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        id="browser-apply-approved",
+                        name="apply_patch",
+                        arguments={"patch_id": approved_patch.patch_id},
+                    ),
+                ),
+            ),
+            ModelResponse(content="Approved patch completed."),
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        id="browser-validate-denied",
+                        name="validate_patch",
+                        arguments={
+                            "diff": denied_diff,
+                            "baselines": [
+                                {"path": "README.md", "sha256": approved_sha},
+                            ],
+                        },
+                    ),
+                ),
+            ),
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        id="browser-apply-denied",
+                        name="apply_patch",
+                        arguments={"patch_id": denied_patch.patch_id},
+                    ),
+                ),
+            ),
+            ModelResponse(content="Denied patch left the project unchanged."),
+        ],
+    )
+
+    class LocalSandboxBoundary:
+        calls = 0
+
+        def __init__(self, root: Path) -> None:
+            self._root = root
+
+        async def execute(self, request: object) -> ExecutionResult:
+            from agent_foundations.execution.models import ExecutionRequest
+
+            assert isinstance(request, ExecutionRequest)
+            assert request.mount_mode == "project_write"
+            type(self).calls += 1
+            prepared = prepare_patch(approved_patch, self._root)
+            apply_prepared_patch_atomically(prepared, self._root)
+            return ExecutionResult(
+                execution_id=request.execution_id,
+                exit_code=0,
+                stdout=b'{"status":"applied"}\n',
+                stderr=b"",
+                timed_out=False,
+                cancelled=False,
+                output_truncated=False,
+            )
+
+        async def cancel(self, execution_id: str) -> None:
+            del execution_id
+
+    monkeypatch.setenv("AGENT_API_KEY", "test-placeholder")
+    monkeypatch.setenv("AGENT_MODEL", "test-model")
+    monkeypatch.setattr(main, "build_provider", lambda: provider)
+    monkeypatch.setattr(main, "DockerBackend", LocalSandboxBoundary)
+    services = main.build_chat_services(tmp_path)
+    app = create_app(tmp_path / "traces", chat_services=services)
+    server, thread, port = _start_server(app)
+    try:
+        browser_page.goto(f"http://127.0.0.1:{port}/chat")
+        browser_page.get_by_role("button", name="New conversation").click()
+        profile = browser_page.get_by_label("Permission profile")
+        options = profile.locator("option").all_text_contents()
+        assert "HOST_FULL_ACCESS" not in options
+        assert all("git_commit" not in option.casefold() for option in options)
+        browser_page.get_by_label("Title").fill("Controlled browser patch")
+        browser_page.get_by_label("Project root").fill(str(project))
+        profile.select_option("ASK_ALWAYS")
+        browser_page.get_by_role("button", name="Create conversation").click()
+        expect(
+            browser_page.get_by_role(
+                "heading",
+                level=1,
+                name="Controlled browser patch",
+            ),
+        ).to_be_visible()
+
+        _send_message(browser_page, "Approve the first patch")
+        card = browser_page.get_by_role("article", name="Approval request")
+        expect(card).to_be_visible(timeout=15_000)
+        expect(card.get_by_role("region", name="Patch preview")).to_contain_text(
+            "README.md",
+        )
+        expect(card).to_contain_text("apply_patch")
+        expect(card).to_contain_text("Docker sandbox")
+        conversations = _run_async(services.repository.list_conversations())
+        conversation_id = conversations[0].conversation_id
+        _latest, pending = _run_async(
+            services.repository.get_conversation_state(conversation_id),
+        )
+        assert pending is not None
+        first_approval_id = pending.approval_id
+
+        browser_page.reload()
+        browser_page.wait_for_load_state("networkidle")
+        browser_page.get_by_role(
+            "button",
+            name=re.compile(r"Controlled browser patch"),
+        ).click()
+        recovered = browser_page.get_by_role("article", name="Approval request")
+        expect(recovered).to_be_visible(timeout=15_000)
+        expect(recovered.get_by_role("region", name="Patch preview")).to_contain_text(
+            "README.md",
+        )
+        recovered.get_by_role("button", name="Approve once", disabled=False).click()
+        expect(browser_page.get_by_text("Approved patch completed.")).to_be_visible(
+            timeout=15_000,
+        )
+        assert readme.read_text(encoding="utf-8") == "approved\n"
+        assert LocalSandboxBoundary.calls == 1
+
+        duplicate = browser_page.request.post(
+            f"http://127.0.0.1:{port}/api/chat/approvals/"
+            f"{first_approval_id}/decision",
+            data='{"decision":"approve"}',
+            headers={"Content-Type": "application/json"},
+        )
+        assert duplicate.status == 409
+        browser_page.reload()
+        browser_page.wait_for_load_state("networkidle")
+        assert readme.read_text(encoding="utf-8") == "approved\n"
+        assert LocalSandboxBoundary.calls == 1
+
+        browser_page.get_by_role(
+            "button",
+            name=re.compile(r"Controlled browser patch"),
+        ).click()
+        _send_message(browser_page, "Deny the second patch")
+        denied_card = browser_page.get_by_role("article", name="Approval request")
+        expect(denied_card).to_be_visible(timeout=15_000)
+        expect(
+            denied_card.get_by_role("region", name="Patch preview"),
+        ).to_contain_text("README.md")
+        denied_card.get_by_role("button", name="Deny", disabled=False).click()
+        expect(
+            browser_page.get_by_text("Denied patch left the project unchanged."),
+        ).to_be_visible(timeout=15_000)
+        assert readme.read_text(encoding="utf-8") == "approved\n"
+        assert LocalSandboxBoundary.calls == 1
+
+        db_path = services.repository._database_path
+        with sqlite3.connect(db_path) as connection:
+            committed = connection.execute(
+                "SELECT COUNT(*) FROM side_effects WHERE status = 'committed'",
+            ).fetchone()[0]
+        assert committed == 1
+        browser_page.reload()
+        browser_page.wait_for_load_state("networkidle")
+        expect(browser_page.get_by_role("article", name="Approval request")).to_have_count(
+            0,
+        )
+        assert readme.read_text(encoding="utf-8") == "approved\n"
+        assert LocalSandboxBoundary.calls == 1
+    finally:
+        _stop_server(server, thread)
+
+
+def test_command_feedback_sanitized_pages_restore_and_narrow_viewport(
+    tmp_path: Path,
+    browser_page: Page,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import UTC, datetime
+    from uuid import UUID
+
+    from agent_foundations.chat.models import ChatToolActivity, ToolActivityStatus
+    from agent_foundations.command_output.repository import CommandArtifactRepository
+    from agent_foundations.command_output.store import CommandArtifactStore
+    from agent_foundations.durable.models import DurableRun, DurableRunStatus
+    from agent_foundations.durable.repository import DurableRunRepository
+    from agent_foundations.security.models import PermissionProfileName
+
+    secret = "Authorization: Bearer sk-test_placeholder_not_real"
+    monkeypatch.setenv("OPENAI_API_KEY", "FAKE_PROVIDER_CREDENTIAL_TASK20")
+    provider = FakeModelProvider([ModelResponse(content="unused")])
+    app, repository, _broker = _build_chat_app(tmp_path, provider)
+    project = tmp_path / "cmd-project"
+    project.mkdir()
+    (project / "README.md").write_text("ok\n", encoding="utf-8")
+    now = datetime(2026, 8, 26, 9, 0, tzinfo=UTC)
+    _run_async(repository.initialize())
+    conversation = _run_async(
+        repository.create_conversation(
+            title="Command output study",
+            project_root=project,
+            permission_profile=PermissionProfileName.PROJECT_FULL_ACCESS,
+        )
+    )
+    _user, run = _run_async(
+        repository.begin_run(
+            conversation.conversation_id,
+            content="inspect gate",
+            session_id="eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        )
+    )
+    db_path = repository._database_path
+    durable = DurableRunRepository(db_path)
+    _run_async(durable.initialize())
+    _run_async(
+        durable.create_run(
+            DurableRun(
+                run_id=run.session_id,
+                project_root=str(project),
+                status=DurableRunStatus.CREATED,
+                schema_version=1,
+                state_version=0,
+                attempt=1,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    )
+    artifacts = CommandArtifactRepository.from_path(db_path)
+    _run_async(artifacts.initialize())
+    store = CommandArtifactStore(tmp_path / "artifacts", repository=artifacts)
+    artifact = store.write(
+        stdout=b"ok\n",
+        stderr=f"{secret}\n".encode(),
+        run_id=UUID(run.session_id),
+    )
+    _run_async(
+        repository.upsert_tool_activity(
+            ChatToolActivity(
+                conversation_id=conversation.conversation_id,
+                session_id=run.session_id,
+                tool_call_id="call-run-command",
+                tool_name="run_command",
+                status=ToolActivityStatus.COMPLETED,
+                arguments_summary="python -m pytest tests",
+                result_summary=(
+                    f"exit=1 failed=1 parser=complete artifact={artifact.artifact_id}"
+                ),
+                started_at=now,
+                finished_at=now,
+                last_event_id="11111111-1111-4111-8111-111111111111",
+            )
+        )
+    )
+    raw_requests: list[str] = []
+    server, thread, port = _start_server(app)
+    try:
+        browser_page.on(
+            "request",
+            lambda request: raw_requests.append(request.url),
+        )
+        browser_page.goto(f"http://127.0.0.1:{port}/chat")
+        browser_page.get_by_role(
+            "button",
+            name=re.compile(r"Command output study"),
+        ).click()
+        toggle = browser_page.get_by_role(
+            "button",
+            name=re.compile(r"1 tool activity", re.IGNORECASE),
+        )
+        expect(toggle).to_be_visible(timeout=15_000)
+        if toggle.get_attribute("aria-expanded") == "false":
+            toggle.click()
+        expect(browser_page.get_by_text("run_command")).to_be_visible()
+        show = browser_page.get_by_role("button", name=re.compile(r"Show sanitized output", re.I))
+        expect(show).to_be_visible()
+        assert not any("/raw" in url or "download-tickets" in url for url in raw_requests)
+        show.click()
+        expect(browser_page.locator(".command-feedback-card__page")).to_be_visible()
+        expect(browser_page.get_by_text(secret)).to_have_count(0)
+        browser_page.get_by_role("tab", name="Stderr").click()
+        expect(browser_page.get_by_text("[REDACTED]")).to_be_visible()
+        expect(browser_page.get_by_text(secret)).to_have_count(0)
+        browser_page.reload()
+        browser_page.wait_for_load_state("networkidle")
+        browser_page.get_by_role(
+            "button",
+            name=re.compile(r"Command output study"),
+        ).click()
+        restored_toggle = browser_page.get_by_role(
+            "button",
+            name=re.compile(r"1 tool activity", re.IGNORECASE),
+        )
+        expect(restored_toggle).to_be_visible(timeout=15_000)
+        if restored_toggle.get_attribute("aria-expanded") == "false":
+            restored_toggle.click()
+        expect(
+            browser_page.get_by_role("button", name=re.compile(r"Show sanitized output", re.I)),
+        ).to_be_visible(timeout=15_000)
+        browser_page.set_viewport_size({"width": 390, "height": 844})
+        overflow = browser_page.evaluate(
+            "() => document.documentElement.scrollWidth"
+            " <= document.documentElement.clientWidth + 1",
+        )
+        assert overflow is True
+    finally:
+        _stop_server(server, thread)

@@ -392,7 +392,7 @@ HTTP、SQLite、Checkpoint 和 side-effect ledger 保存可恢复事实；SSE �
 - [ ] 第 5 周：实现 TraceEvent、EventSink、JSONL、脱敏和回放。
 - [ ] 第 6 周：实现 FastAPI、SSE 和本地 Web Trace Viewer，完成第一阶段验收。
 
-Phase 1D 作为进入 Phase 2 前的独立验收增量，保持已确认的范围和 12 个顺序 Task 不变。Task 12 实现（恢复 API、E2E、文档）已完成 fresh 门禁，用户于 2026-08-08 确认第一阶段通过人工验收；Phase 1D 没有提前加入 MCP、Memory、Sub-Agent、Shell、Sandbox 或 Token streaming。Phase 2 设计与详细实施计划已生成，尚未授权或开始任何实现 Task。
+Phase 1D 作为进入 Phase 2 前的独立验收增量，保持已确认的范围和 12 个顺序 Task 不变。Task 12 实现（恢复 API、E2E、文档）已完成 fresh 门禁，用户于 2026-08-08 确认第一阶段通过人工验收；Phase 1D 没有提前加入 MCP、Memory、Sub-Agent、Shell、Sandbox 或 Token streaming。Phase 2 设计与详细实施计划已生成，Task 1–24 已按顺序实现并通过用户验收；Task 25 是自动化总门禁。真实付费模型 3×3、独立 reviewer 复验和用户确认 Phase 2 完成仍不构成本文件的自动勾选。
 
 第一阶段完成标准：
 

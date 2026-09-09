@@ -8,6 +8,7 @@ from agent_foundations.domain.tool import Tool, ToolResult
 from agent_foundations.runtime.tool_execution import ToolCallExecutor, ToolExecutionContext
 from agent_foundations.tools.patch.models import BaselineEntry, ValidatedPatch
 from agent_foundations.tools.patch.repository import PatchProposalRepository, PatchRepositoryError
+from agent_foundations.tools.patch.structured import compile_structured_changes
 from agent_foundations.tools.patch.validate_patch import VALIDATE_PATCH_TOOL_NAME, ValidatePatchTool
 from agent_foundations.tools.patch.validator import PatchValidationError, parse_and_validate_patch
 
@@ -41,10 +42,22 @@ def build_patch_success_result(patch: ValidatedPatch) -> ToolResult:
 def sanitize_validate_patch_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     diff = str(arguments.get("diff", ""))
     baselines = arguments.get("baselines", [])
+    changes = arguments.get("changes", [])
+    change_paths: list[str] = []
+    change_count = 0
+    if isinstance(changes, list):
+        change_count = len(changes)
+        for item in changes:
+            if isinstance(item, dict):
+                path = item.get("path")
+                if isinstance(path, str):
+                    change_paths.append(path)
     return {
         "redacted": True,
         "diff_bytes": len(diff.encode("utf-8")),
         "baseline_count": len(baselines) if isinstance(baselines, list) else 0,
+        "change_count": change_count,
+        "change_paths": change_paths,
     }
 
 
@@ -122,12 +135,33 @@ class PatchProposalExecutor:
                     error_code="PATCH_CONTEXT_REQUIRED",
                 )
             try:
-                baselines = tuple(
-                    BaselineEntry.model_validate(item)
-                    for item in arguments.get("baselines", [])
-                )
+                has_diff = "diff" in arguments
+                has_changes = "changes" in arguments
+                if has_diff and has_changes:
+                    return ToolResult(
+                        success=False,
+                        content="diff and changes are mutually exclusive",
+                        error_code="PATCH_INVALID_ARGUMENTS",
+                    )
+                if has_changes:
+                    diff, baselines = compile_structured_changes(
+                        arguments.get("changes") or [],
+                        context.root,
+                    )
+                elif has_diff:
+                    baselines = tuple(
+                        BaselineEntry.model_validate(item)
+                        for item in arguments.get("baselines", [])
+                    )
+                    diff = str(arguments["diff"])
+                else:
+                    return ToolResult(
+                        success=False,
+                        content="validate_patch requires diff or changes",
+                        error_code="PATCH_INVALID_ARGUMENTS",
+                    )
                 patch = parse_and_validate_patch(
-                    str(arguments["diff"]),
+                    diff,
                     baselines,
                     context.root,
                 )

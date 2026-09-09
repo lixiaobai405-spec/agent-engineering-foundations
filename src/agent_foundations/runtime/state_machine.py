@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import StrEnum
 from typing import Literal, Protocol, runtime_checkable
 
@@ -25,6 +26,7 @@ class CheckpointReason(StrEnum):
     PLAN_UPDATE = "plan_update"
     FINALIZING = "finalizing"
     RETRY_STARTED = "retry_started"
+    PROVIDER_ATTEMPT = "provider_attempt"
 
 
 class RunCancelledError(RuntimeError):
@@ -43,6 +45,7 @@ class AgentRunState(ValidatedCopyModel):
     attempt: int = Field(ge=1)
     last_committed_tool_fact: ExecutionFact | None = None
     final_answer: str | None = None
+    provider_attempts: Mapping[str, int] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_phase_constraints(self) -> AgentRunState:

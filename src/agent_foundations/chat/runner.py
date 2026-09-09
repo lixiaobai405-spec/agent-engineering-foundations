@@ -5,6 +5,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
+from agent_foundations.chat.durable_checkpoint import (
+    load_latest_conversation_plan,
+    load_provider_attempts,
+    make_chat_checkpoint_sink,
+)
 from agent_foundations.chat.events import (
     ChatEventBroker,
     ChatProjectionSink,
@@ -19,8 +24,16 @@ from agent_foundations.chat.models import (
     RunStatus,
     utc_now,
 )
-from agent_foundations.chat.repository import ConversationRepository
+from agent_foundations.chat.repository import (
+    ConversationRepository,
+    cancel_durable_run_if_active,
+)
 from agent_foundations.domain.messages import Message, Role
+from agent_foundations.durable.models import DurableRun, DurableRunStatus
+from agent_foundations.durable.repository import (
+    DurableRunNotFoundError,
+    DurableRunRepository,
+)
 from agent_foundations.runtime.loop import AgentLoop
 from agent_foundations.runtime.redaction import Redactor
 from agent_foundations.runtime.sinks import CompositeEventSink, JsonlEventSink
@@ -75,6 +88,7 @@ class ConversationRunner:
             [Conversation, str],
             ToolCallExecutor,
         ] = direct_executor_factory,
+        durable_repository: DurableRunRepository | None = None,
     ) -> None:
         self._repository = repository
         self._broker = broker
@@ -82,6 +96,7 @@ class ConversationRunner:
         self._trace_dir = Path(trace_dir)
         self._redactor_factory = redactor_factory
         self._tool_executor_factory = tool_executor_factory
+        self._durable_repository = durable_repository
 
     async def run_turn(
         self,
@@ -101,6 +116,7 @@ class ConversationRunner:
                 RunStatus.QUEUED,
                 RunStatus.RUNNING,
             )
+            await self._ensure_durable_run(session_id, conversation)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -134,11 +150,32 @@ class ConversationRunner:
             )
             tool_executor = self._tool_executor_factory(conversation, session_id)
             loop = self._runtime_factory(conversation, event_sink, tool_executor)
+            checkpoint_sink = None
+            provider_attempts: dict[str, int] = {}
+            plan_snapshot = None
+            if self._durable_repository is not None:
+                checkpoint_sink = await make_chat_checkpoint_sink(
+                    self._durable_repository,
+                    session_id,
+                )
+                provider_attempts = await load_provider_attempts(
+                    self._durable_repository,
+                    session_id,
+                )
+                prior_runs = await self._repository.list_runs(conversation_id)
+                plan_snapshot = await load_latest_conversation_plan(
+                    self._durable_repository,
+                    [run.session_id for run in prior_runs],
+                    exclude_session_id=session_id,
+                )
             result = await loop.run(
                 Path(conversation.project_root),
                 query,
                 history=history,
                 session_id=session_id,
+                checkpoint_sink=checkpoint_sink,
+                provider_attempts=provider_attempts,
+                plan_snapshot=plan_snapshot,
             )
 
             complete_task = asyncio.create_task(
@@ -160,6 +197,11 @@ class ConversationRunner:
                     await self._safe_interrupt_run(session_id)
                 raise
 
+            await self._transition_durable(
+                session_id,
+                DurableRunStatus.RUNNING,
+                DurableRunStatus.COMPLETED,
+            )
             await self._publish_completion_events(
                 conversation_id,
                 session_id,
@@ -173,6 +215,9 @@ class ConversationRunner:
             if await self._is_completed(session_id):
                 raise
             await self._safe_fail_run(session_id, conversation_id, exc)
+
+    async def interrupt_run(self, session_id: str) -> None:
+        await self._safe_interrupt_run(session_id)
 
     async def _publish_completion_events(
         self,
@@ -212,6 +257,7 @@ class ConversationRunner:
         if run.status in _TERMINAL_RUN_STATUSES:
             return
         await self._repository.interrupt_run(session_id)
+        await cancel_durable_run_if_active(self._durable_repository, session_id)
 
     async def _safe_fail_run(
         self,
@@ -223,6 +269,11 @@ class ConversationRunner:
         if run.status in _TERMINAL_RUN_STATUSES:
             return
         await self._repository.fail_run(session_id, type(exc).__name__)
+        await self._transition_durable(
+            session_id,
+            DurableRunStatus.RUNNING,
+            DurableRunStatus.FAILED,
+        )
         await self._broker.publish(
             ChatEvent(
                 conversation_id=conversation_id,
@@ -235,3 +286,46 @@ class ConversationRunner:
                 },
             ),
         )
+
+    async def _ensure_durable_run(
+        self,
+        session_id: str,
+        conversation: Conversation,
+    ) -> None:
+        if self._durable_repository is None:
+            return
+        try:
+            await self._durable_repository.get_run(session_id)
+            return
+        except DurableRunNotFoundError:
+            pass
+        now = utc_now()
+        await self._durable_repository.create_run(
+            DurableRun(
+                run_id=session_id,
+                project_root=conversation.project_root,
+                status=DurableRunStatus.RUNNING,
+                schema_version=1,
+                state_version=0,
+                attempt=1,
+                created_at=now,
+                updated_at=now,
+            ),
+        )
+
+    async def _transition_durable(
+        self,
+        session_id: str,
+        expected: DurableRunStatus,
+        target: DurableRunStatus,
+    ) -> None:
+        if self._durable_repository is None:
+            return
+        try:
+            await self._durable_repository.transition_status(
+                session_id,
+                expected,
+                target,
+            )
+        except DurableRunNotFoundError:
+            return

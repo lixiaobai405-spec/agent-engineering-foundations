@@ -1,0 +1,6 @@
+ ✓ app passes
+ × app fails 1ms
+   → expected 1 to be 2
+ ↓ app skips
+ Test Files  1 failed (1)
+      Tests  1 failed | 1 passed | 1 skipped

@@ -1,14 +1,31 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from pathlib import Path
 from time import perf_counter
 from typing import cast
-from uuid import uuid4
+from uuid import UUID, uuid4, uuid5
 
 from agent_foundations.context.builder import ContextBuilder
+from agent_foundations.context.cache import ContextSourceCache
+from agent_foundations.context.compaction import (
+    ContextCompactor,
+    assign_stable_message_ids,
+    build_compaction_request,
+    compaction_record_accepted,
+    drop_raw_artifact_messages,
+    merge_compacted_view,
+)
+from agent_foundations.context.critical_facts import extract_critical_facts
+from agent_foundations.context.fake_compactor import FakeCompactor
+from agent_foundations.context.relevance import RelevanceScorer, rank_sources
+from agent_foundations.context.repo_map import RepoMapBuilder, RepoMapLimits
+from agent_foundations.context.sources import ContextSource
 from agent_foundations.domain._freeze import FrozenJSON, to_json_value
 from agent_foundations.domain.errors import (
     ContextBudgetExceededError,
+    InvalidModelResponseError,
     MaxStepsExceededError,
     ProviderError,
     ToolError,
@@ -18,8 +35,16 @@ from agent_foundations.domain.model import ModelProvider, ModelRequest
 from agent_foundations.domain.tool import ToolResult
 from agent_foundations.planning.controller import PlanController
 from agent_foundations.planning.execution import ExecutionFact, PlanningRequiredError
+from agent_foundations.planning.models import ExecutionPlan
 from agent_foundations.planning.tools import PLANNING_TOOL_NAMES
+from agent_foundations.providers.resilient import ResilientModelProvider
 from agent_foundations.runtime.agent import AgentConfig, AgentResult, PlanningMode
+from agent_foundations.runtime.coding_budget import evaluate_budget
+from agent_foundations.runtime.recovery import (
+    approval_pending_answer,
+    evaluate_tool_call,
+    should_request_model,
+)
 from agent_foundations.runtime.session import AgentSession, SessionStatus
 from agent_foundations.runtime.state_machine import (
     AgentRunPhase,
@@ -35,11 +60,46 @@ from agent_foundations.runtime.tool_execution import (
     ToolExecutionContext,
 )
 from agent_foundations.runtime.trace import EventSink, TraceEvent
+from agent_foundations.tools.filesystem.path_policy import PathPolicy
 from agent_foundations.tools.patch.execution import (
     sanitize_trace_message,
     sanitize_trace_payload_for_tool,
 )
 from agent_foundations.tools.registry import ToolRegistry
+
+_COMMAND_OUTPUT_TOOLS = frozenset(
+    {"run_command", "read_command_output", "search_command_output"},
+)
+
+
+def _tool_message_content(name: str, result: ToolResult) -> str:
+    dumped = result.model_dump(mode="json")
+    if name in _COMMAND_OUTPUT_TOOLS:
+        payload = dict(dumped.get("metadata") or {})
+        if result.error_code:
+            payload = {
+                "error_code": result.error_code,
+                "content": result.content,
+                **payload,
+            }
+        return json.dumps(payload, ensure_ascii=False)
+    return result.model_dump_json()
+
+
+def _tool_trace_result(name: str, result: ToolResult) -> dict[str, object]:
+    dumped = result.model_dump(mode="json")
+    if name not in _COMMAND_OUTPUT_TOOLS:
+        return dumped
+    metadata = dumped.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return {
+        "success": dumped["success"],
+        "content": dumped["content"],
+        "error_code": dumped["error_code"],
+        "metadata": metadata,
+    }
+
 
 _ALLOWED_PLAN_EVENTS = frozenset({
     "plan.created",
@@ -101,6 +161,9 @@ class AgentLoop:
         config: AgentConfig,
         tool_executor: ToolCallExecutor | None = None,
         plan_controller: PlanController | None = None,
+        compactor: ContextCompactor | None = None,
+        conversation_repository: object | None = None,
+        conversation_id: str | None = None,
     ) -> None:
         self._provider = provider
         self._registry = registry
@@ -109,6 +172,10 @@ class AgentLoop:
         self._config = config
         self._tool_executor = tool_executor or DirectToolCallExecutor()
         self._plan_controller = plan_controller
+        self._context_cache = ContextSourceCache()
+        self._compactor: ContextCompactor = compactor or FakeCompactor()
+        self._conversation_repository = conversation_repository
+        self._conversation_id = conversation_id
 
     async def run(
         self,
@@ -120,6 +187,8 @@ class AgentLoop:
         checkpoint_sink: CheckpointSink | None = None,
         cancellation_token: CancellationToken | None = None,
         attempt: int = 1,
+        provider_attempts: Mapping[str, int] | None = None,
+        plan_snapshot: ExecutionPlan | None = None,
     ) -> AgentResult:
         _validate_history(history)
         session = AgentSession(
@@ -141,11 +210,13 @@ class AgentLoop:
             next_step=1,
             phase=AgentRunPhase.READY_FOR_MODEL,
             next_tool_index=0,
-            plan_snapshot=None,
+            plan_snapshot=plan_snapshot,
             attempt=attempt,
             last_committed_tool_fact=None,
             final_answer=None,
+            provider_attempts=dict(provider_attempts or {}),
         )
+        self._restore_plan_snapshot(initial_state.plan_snapshot)
         return await self._drive(
             session,
             initial_state,
@@ -193,6 +264,14 @@ class AgentLoop:
                 )
 
             if state.phase == AgentRunPhase.READY_FOR_MODEL:
+                if not should_request_model(state.messages):
+                    state = await self._transition_to_finalizing(
+                        session,
+                        state,
+                        approval_pending_answer(state.messages),
+                        state.next_step,
+                    )
+                    continue
                 state = await self._request_model(
                     session,
                     state,
@@ -244,8 +323,36 @@ class AgentLoop:
     ) -> AgentRunState:
         await self._check_cancelled(cancellation_token, session)
         step = state.next_step
+        sources, snapshot = self._repository_context(session)
+        await self._emit(
+            session,
+            step,
+            "context.snapshot",
+            "completed",
+            "Context sources selected",
+            payload=snapshot,
+        )
+        model_messages, compaction_payload = await self._maybe_compact(session)
+        if compaction_payload is not None:
+            await self._emit(
+                session,
+                step,
+                "context.compaction",
+                "completed",
+                "Context compacted",
+                payload=compaction_payload,
+            )
         try:
-            context = self._context_builder.build(tuple(session.messages))
+            policy: PathPolicy | None
+            try:
+                policy = PathPolicy(session.root)
+            except (OSError, ValueError):
+                policy = None
+            context = self._context_builder.build(
+                model_messages,
+                sources=sources,
+                policy=policy,
+            )
         except ContextBudgetExceededError as exc:
             session.status = SessionStatus.FAILED
             await self._emit(
@@ -257,10 +364,50 @@ class AgentLoop:
                 payload={"error": type(exc).__name__},
             )
             raise
+        except Exception:
+            try:
+                context = self._context_builder.build(model_messages)
+            except ContextBudgetExceededError as exc:
+                session.status = SessionStatus.FAILED
+                await self._emit(
+                    session,
+                    step,
+                    "session.failed",
+                    "failed",
+                    "Context budget exceeded",
+                    payload={"error": type(exc).__name__},
+                )
+                raise
         request = ModelRequest(
             messages=context,
             tools=self._registry.definitions(),
+            run_id=UUID(session.session_id),
+            request_id=uuid5(
+                UUID(session.session_id),
+                f"model:{state.next_step}:{state.phase.value}",
+            ),
         )
+        state_box = {"state": state}
+        if isinstance(self._provider, ResilientModelProvider):
+            assert request.run_id is not None
+            self._provider.hydrate_budget(request.run_id, state.provider_attempts)
+            self._provider.attach(
+                checkpoint_sink=checkpoint_sink,
+                state_box=state_box,
+                cancellation_token=cancellation_token,
+            )
+
+            async def _trace_retry(payload: dict[str, object]) -> None:
+                await self._emit(
+                    session,
+                    step,
+                    "provider.retry",
+                    "started",
+                    "Retrying provider",
+                    payload=payload,
+                )
+
+            self._provider.bind_retry_tracer(_trace_retry)
         await self._emit(
             session,
             step,
@@ -278,6 +425,42 @@ class AgentLoop:
         started = perf_counter()
         try:
             response = await self._provider.complete(request)
+        except InvalidModelResponseError as exc:
+            await self._emit(
+                session,
+                step,
+                "model.response.invalid",
+                "failed",
+                "Invalid model response",
+                payload={
+                    "error": type(exc).__name__,
+                    "raw_response": _safe_raw_response(
+                        getattr(exc, "raw_response", None),
+                    ),
+                },
+            )
+            session.messages.append(Message(
+                role=Role.ASSISTANT,
+                content="INVALID_MODEL_RESPONSE: provider returned an invalid response",
+                tool_calls=(),
+            ))
+            invalid_updates: dict[str, object] = {
+                "messages": tuple(session.messages),
+                "phase": AgentRunPhase.READY_FOR_MODEL,
+                "next_tool_index": 0,
+                "next_step": state.next_step + 1,
+            }
+            if isinstance(self._provider, ResilientModelProvider) and request.run_id is not None:
+                invalid_updates["provider_attempts"] = self._provider.budget.snapshot(
+                    request.run_id,
+                ) or dict(state.provider_attempts)
+            persisted = state.model_copy(update=invalid_updates)
+            await self._save_checkpoint(
+                checkpoint_sink,
+                persisted,
+                CheckpointReason.MODEL_RESPONSE,
+            )
+            return persisted
         except ProviderError as exc:
             session.status = SessionStatus.FAILED
             await self._emit(
@@ -305,6 +488,7 @@ class AgentLoop:
                 payload={"error": type(exc).__name__},
             )
             raise
+        state = state_box["state"]
         await self._emit(
             session,
             step,
@@ -329,13 +513,16 @@ class AgentLoop:
             content=response.content,
             tool_calls=response.tool_calls,
         ))
-        persisted = state.model_copy(
-            update={
-                "messages": tuple(session.messages),
-                "phase": AgentRunPhase.MODEL_RESPONSE_PERSISTED,
-                "next_tool_index": 0,
-            },
-        )
+        persisted_updates: dict[str, object] = {
+            "messages": tuple(session.messages),
+            "phase": AgentRunPhase.MODEL_RESPONSE_PERSISTED,
+            "next_tool_index": 0,
+        }
+        if isinstance(self._provider, ResilientModelProvider) and request.run_id is not None:
+            persisted_updates["provider_attempts"] = self._provider.budget.snapshot(
+                request.run_id,
+            ) or dict(state.provider_attempts)
+        persisted = state.model_copy(update=persisted_updates)
         await self._save_checkpoint(
             checkpoint_sink,
             persisted,
@@ -427,46 +614,80 @@ class AgentLoop:
                 },
             ),
         )
-        try:
-            tool, normalized = self._registry.validate_call(
-                call.name,
-                call.arguments,
-            )
-            await self._emit(
-                session,
-                step,
-                "tool.call.validated",
-                "completed",
-                f"Validated {call.name}",
-            )
-            execution_context = ToolExecutionContext(
-                session_id=session.session_id,
-                root=session.root,
-                tool_call_id=call.id,
-                tool_name=call.name,
-            )
-            result = await self._tool_executor.execute(
-                tool,
-                normalized,
-                execution_context,
-            )
-        except ToolError as exc:
+        if call.argument_parse_error:
             result = ToolResult(
                 success=False,
-                content=str(exc),
-                error_code=type(exc).__name__,
+                content=call.argument_parse_error,
+                error_code="INVALID_TOOL_JSON",
             )
-        except Exception as exc:
-            session.status = SessionStatus.FAILED
-            await self._emit(
-                session,
-                step,
-                "session.failed",
-                "failed",
-                "Unexpected tool failure",
-                payload={"error": type(exc).__name__},
-            )
-            raise
+        else:
+            try:
+                tool, normalized = self._registry.validate_call(
+                    call.name,
+                    call.arguments,
+                )
+                await self._emit(
+                    session,
+                    step,
+                    "tool.call.validated",
+                    "completed",
+                    f"Validated {call.name}",
+                )
+                execution_context = ToolExecutionContext(
+                    session_id=session.session_id,
+                    root=session.root,
+                    tool_call_id=call.id,
+                    tool_name=call.name,
+                )
+                decision = evaluate_tool_call(state.messages, call.name, call.arguments)
+                if not decision.allowed:
+                    result = ToolResult(
+                        success=False,
+                        content=decision.message or "recovery blocked",
+                        error_code=decision.error_code,
+                    )
+                elif self._config.coding_budget is not None:
+                    budget = evaluate_budget(
+                        state.messages,
+                        call.name,
+                        call.arguments,
+                        self._config.coding_budget,
+                    )
+                    if not budget.allowed:
+                        result = ToolResult(
+                            success=False,
+                            content=budget.message or "budget exceeded",
+                            error_code=budget.error_code,
+                        )
+                    else:
+                        result = await self._tool_executor.execute(
+                            tool,
+                            normalized,
+                            execution_context,
+                        )
+                else:
+                    result = await self._tool_executor.execute(
+                        tool,
+                        normalized,
+                        execution_context,
+                    )
+            except ToolError as exc:
+                result = ToolResult(
+                    success=False,
+                    content=str(exc),
+                    error_code=type(exc).__name__,
+                )
+            except Exception as exc:
+                session.status = SessionStatus.FAILED
+                await self._emit(
+                    session,
+                    step,
+                    "session.failed",
+                    "failed",
+                    "Unexpected tool failure",
+                    payload={"error": type(exc).__name__},
+                )
+                raise
 
         event_type = "tool.call.completed" if result.success else "tool.call.failed"
         await self._emit(
@@ -478,7 +699,7 @@ class AgentLoop:
             payload={
                 "tool_call_id": call.id,
                 "name": call.name,
-                "result": result.model_dump(mode="json"),
+                "result": _tool_trace_result(call.name, result),
             },
         )
         if result.success and call.name in PLANNING_TOOL_NAMES:
@@ -490,7 +711,7 @@ class AgentLoop:
             role=Role.TOOL,
             name=call.name,
             tool_call_id=call.id,
-            content=result.model_dump_json(),
+            content=_tool_message_content(call.name, result),
         ))
         fact = ExecutionFact(
             session_id=session.session_id,
@@ -594,14 +815,56 @@ class AgentLoop:
                 session.status = SessionStatus.CANCELLED
             raise RunCancelledError("run cancelled")
 
+    def _repository_context(
+        self,
+        session: AgentSession,
+    ) -> tuple[tuple[ContextSource, ...], dict[str, object]]:
+        empty: dict[str, object] = {
+            "sources": [],
+            "truncated": False,
+            "cache": "none",
+        }
+        try:
+            policy = PathPolicy(session.root)
+            mapper = RepoMapBuilder(cache=self._context_cache, policy=policy)
+            repo_map = mapper.build(session.root, RepoMapLimits())
+            query = ""
+            for message in reversed(session.messages):
+                if message.role is Role.USER and message.content:
+                    query = message.content
+                    break
+            scorer = RelevanceScorer()
+            ranked = rank_sources(query, repo_map.sources)
+            entries: list[dict[str, object]] = []
+            for source in ranked:
+                entries.append(
+                    {
+                        "source_id": source.source_id,
+                        "kind": source.kind,
+                        "provenance": source.provenance,
+                        "fingerprint": source.fingerprint,
+                        "chars": len(source.content),
+                        "score": scorer.score(query, source),
+                        "decision": "selected",
+                        "truncated": repo_map.truncated,
+                    }
+                )
+            return ranked, {
+                "sources": entries,
+                "truncated": repo_map.truncated,
+                "cache": mapper.last_cache_status,
+            }
+        except ContextBudgetExceededError:
+            raise
+        except Exception:
+            return (), empty
+
     def _restore_plan_snapshot(
         self,
         plan_snapshot: object | None,
     ) -> None:
         if plan_snapshot is None or self._plan_controller is None:
             return
-        from agent_foundations.planning.models import ExecutionPlan
-
         if not isinstance(plan_snapshot, ExecutionPlan):
             raise TypeError("plan_snapshot must be ExecutionPlan")
         self._plan_controller.restore(plan_snapshot)
@@ -625,9 +888,36 @@ class AgentLoop:
         if plan_event not in _ALLOWED_PLAN_EVENTS:
             return
         payload: dict[str, object] = {}
-        for key in ("plan_id", "version", "step_id", "status", "replan_count", "reason"):
-            if key in result.metadata:
-                payload[key] = result.metadata[key]
+        if self._plan_controller is not None and self._plan_controller.has_plan:
+            snapshot = self._plan_controller.snapshot()
+            payload.update(
+                {
+                    "plan_id": snapshot.plan_id,
+                    "version": snapshot.version,
+                    "goal": snapshot.goal,
+                    "replan_count": snapshot.replan_count,
+                    "max_replans": snapshot.max_replans,
+                    "steps": [
+                        {
+                            "step_id": step.step_id,
+                            "status": step.status.value,
+                            "description": step.description,
+                        }
+                        for step in snapshot.steps
+                    ],
+                },
+            )
+        else:
+            for key in (
+                "plan_id",
+                "version",
+                "step_id",
+                "status",
+                "replan_count",
+                "reason",
+            ):
+                if key in result.metadata:
+                    payload[key] = result.metadata[key]
         await self._emit(
             session,
             step_id,
@@ -657,3 +947,42 @@ class AgentLoop:
             summary=summary,
             payload=payload or {},
         ))
+
+    async def _maybe_compact(
+        self,
+        session: AgentSession,
+    ) -> tuple[tuple[Message, ...], dict[str, object] | None]:
+        originals = tuple(session.messages)
+        if not self._context_builder.needs_compaction(originals):
+            return drop_raw_artifact_messages(originals), None
+        assigned = assign_stable_message_ids(originals)
+        if any(message.message_id is None for message in assigned):
+            return drop_raw_artifact_messages(originals), None
+        session.messages[:] = list(assigned)
+        try:
+            facts = extract_critical_facts(assigned)
+            request = build_compaction_request(
+                assigned,
+                budget=self._context_builder.budget,
+                critical_facts=facts,
+                conversation_id=self._conversation_id,
+            )
+            record = await self._compactor.compact(request)
+            if not compaction_record_accepted(record):
+                return drop_raw_artifact_messages(assigned), None
+            view = merge_compacted_view(assigned, record)
+            source_ids = [str(item) for item in record.source_message_ids]
+            payload: dict[str, object] = {
+                "schema_version": record.schema_version,
+                "message_id_range": source_ids[:1] + source_ids[-1:] if source_ids else [],
+                "source_fingerprint": record.source_fingerprint,
+                "reason": record.reason.value,
+                "original_units": record.original_units,
+                "compacted_units": record.compacted_units,
+                "critical_fact_fingerprints": [
+                    fact.fingerprint for fact in record.critical_facts
+                ],
+            }
+            return drop_raw_artifact_messages(view), payload
+        except Exception:
+            return drop_raw_artifact_messages(assigned), None

@@ -73,3 +73,11 @@ def test_mandatory_items_exceeding_max_chars_raises() -> None:
 
     with pytest.raises(ContextBudgetExceededError):
         builder.build(messages)
+
+
+def test_budget_default_source_cap_does_not_change_legacy_limits() -> None:
+    budget = ContextBudget()
+    assert budget.max_chars == 32_000
+    assert budget.max_tool_result_chars == 8_000
+    assert getattr(budget, "max_source_chars", None) == 4_000
+    assert budget.compaction_trigger_chars == 32_000

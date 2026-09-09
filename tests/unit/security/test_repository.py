@@ -68,7 +68,7 @@ async def test_empty_database_migrates_idempotently_to_v7(tmp_path: Path) -> Non
     await repository.initialize()
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
         tables = {
             row[0]
             for row in connection.execute(
@@ -83,7 +83,7 @@ async def test_v6_upgrade_preserves_existing_tables_rows_and_indexes(tmp_path: P
     AuthorizationRepository, _Corrupt, _Issuer = _components()
     path = tmp_path / "state.sqlite3"
     migrations = get_application_migrations()
-    assert migrations[-1].version == 7
+    assert migrations[-1].version == 10
     await SqliteDatabase(path, migrations[:-1]).initialize()
     with sqlite3.connect(path) as connection:
         connection.execute(
@@ -107,7 +107,7 @@ async def test_v6_upgrade_preserves_existing_tables_rows_and_indexes(tmp_path: P
     repository = AuthorizationRepository.from_path(path)
     await repository.initialize()
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
         assert connection.execute("SELECT title FROM conversations").fetchone()[0] == (
             "Preserved"
         )
@@ -151,7 +151,7 @@ async def test_each_real_v1_through_v6_database_upgrades_to_v7(
 
     await AuthorizationRepository.from_path(path).initialize()
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
         assert connection.execute("SELECT title FROM conversations").fetchone()[0] == (
             f"Preserved v{starting_version}"
         )
@@ -191,7 +191,7 @@ async def test_future_schema_is_rejected(tmp_path: Path) -> None:
     AuthorizationRepository, _Corrupt, _Issuer = _components()
     path = tmp_path / "state.sqlite3"
     with sqlite3.connect(path) as connection:
-        connection.execute("PRAGMA user_version = 8")
+        connection.execute("PRAGMA user_version = 11")
     with pytest.raises(FutureSchemaVersionError):
         await AuthorizationRepository.from_path(path).initialize()
 

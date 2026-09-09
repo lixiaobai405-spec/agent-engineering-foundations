@@ -21,6 +21,7 @@ from starlette.types import Message
 from agent_foundations.chat.approvals import ApprovalCoordinator
 from agent_foundations.chat.events import ChatEventBroker, encode_chat_sse
 from agent_foundations.chat.models import (
+    ApprovalStatus,
     ChatEvent,
     ChatEventType,
     ChatToolActivity,
@@ -804,7 +805,12 @@ def test_conversation_state_no_run_shape(
         conversation_id = _create_conversation_via_api(client, project_root)
         response = client.get(f"/api/chat/conversations/{conversation_id}/state")
         assert response.status_code == 200
-        assert response.json() == {"latest_run": None, "pending_approval": None}
+        assert response.json() == {
+            "latest_run": None,
+            "pending_approval": None,
+            "patch_preview": None,
+            "plan": None,
+        }
 
 
 def test_conversation_state_running_run(
@@ -893,10 +899,122 @@ def test_conversation_state_waiting_approval_exact_fields(
             "tool_name": "read_file",
             "canonical_path": "/tmp/recovery.txt",
             "operation": "read",
+            "resource_kind": "project_path",
             "scope": "external_exact_path",
+            "policy_decision": "ask",
             "status": "pending",
             "requested_at": body["pending_approval"]["requested_at"],
         }
+
+
+def test_conversation_state_recovers_bounded_patch_preview_from_sqlite(
+    tmp_path: Path,
+    chat_stack: tuple[Any, ConversationRepository, ChatEventBroker, RunSupervisor, Path],
+) -> None:
+    from dataclasses import replace
+
+    from agent_foundations.chat.models import AccessOperation
+    from agent_foundations.durable.models import DurableRun, DurableRunStatus
+    from agent_foundations.durable.repository import DurableRunRepository
+    from agent_foundations.tools.patch.models import BaselineEntry
+    from agent_foundations.tools.patch.repository import PatchProposalRepository
+    from agent_foundations.tools.patch.validator import parse_and_validate_patch
+
+    services, repository, _broker, _supervisor, project_root = chat_stack
+    database_path = repository._database_path
+    patch_repository = PatchProposalRepository.from_path(database_path)
+    durable_repository = DurableRunRepository(database_path)
+    services = replace(services, patch_repository=patch_repository)
+    with _make_client(services, tmp_path) as client:
+        readme = project_root / "README.md"
+        readme.write_text("hello\n", encoding="utf-8", newline="\n")
+        conversation_id = _create_conversation_via_api(
+            client,
+            project_root,
+            permission_mode="ASK_FOR_ACCESS",
+        )
+        session_id = str(uuid4())
+        _message, run = asyncio.run(
+            repository.begin_run(
+                conversation_id,
+                content="preview patch",
+                session_id=session_id,
+            ),
+        )
+        asyncio.run(
+            repository.transition_run(
+                session_id,
+                RunStatus.QUEUED,
+                RunStatus.RUNNING,
+            ),
+        )
+        now = datetime.now(UTC)
+        asyncio.run(
+            durable_repository.create_run(
+                DurableRun(
+                    run_id=session_id,
+                    project_root=str(project_root),
+                    status=DurableRunStatus.RUNNING,
+                    schema_version=1,
+                    state_version=0,
+                    attempt=1,
+                    created_at=now,
+                    updated_at=now,
+                ),
+            ),
+        )
+        baseline = __import__("hashlib").sha256(readme.read_bytes()).hexdigest()
+        patch = parse_and_validate_patch(
+            """diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1 @@
+-hello
++hello controlled
+""",
+            (BaselineEntry(path="README.md", sha256=baseline),),
+            project_root,
+        )
+        asyncio.run(patch_repository.save(session_id, patch))
+        asyncio.run(
+            repository.transition_run(
+                session_id,
+                RunStatus.RUNNING,
+                RunStatus.WAITING_APPROVAL,
+            ),
+        )
+        approval = asyncio.run(
+            repository.create_approval(
+                conversation_id=conversation_id,
+                session_id=session_id,
+                tool_call_id="apply-call",
+                tool_name="apply_patch",
+                canonical_path=f"patch:{patch.patch_id}",
+                operation=AccessOperation.APPLY,
+            ),
+        )
+
+        response = client.get(f"/api/chat/conversations/{conversation_id}/state")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["pending_approval"]["approval_id"] == approval.approval_id
+    assert body["patch_preview"] == {
+        "patch_id": patch.patch_id,
+        "files": [
+            {
+                "path": "README.md",
+                "operation": "modify",
+                "hunk_count": 1,
+                "baseline_status": "matched",
+                "summary": "+1 -1",
+            },
+        ],
+    }
+    serialized = json.dumps(body)
+    assert "hello controlled" not in serialized
+    assert "diff --git" not in serialized
+    assert run.session_id == session_id
 
 
 @pytest.mark.parametrize("terminal_status", ["completed", "failed", "interrupted"])
@@ -1023,6 +1141,105 @@ def test_list_conversation_runs_returns_turn_mapping_and_stable_errors(
         assert missing.json() == {"detail": "not found"}
 
 
+def test_permission_profile_v8_api_shape_and_version_increment(
+    tmp_path: Path,
+    chat_stack: tuple[Any, ConversationRepository, ChatEventBroker, RunSupervisor, Path],
+) -> None:
+    services, _repository, _broker, _supervisor, project_root = chat_stack
+    with _make_client(services, tmp_path) as client:
+        created = client.post(
+            "/api/chat/conversations",
+            json={
+                "title": "Versioned profile",
+                "project_root": str(project_root),
+                "permission_profile": "PROJECT_READ_ONLY",
+            },
+        )
+        assert created.status_code == 201
+        body = created.json()
+        assert body["permission_profile"] == "PROJECT_READ_ONLY"
+        assert body["profile_version"] == 1
+
+        changed = client.patch(
+            f"/api/chat/conversations/{body['conversation_id']}",
+            json={"permission_profile": "RISK_BASED"},
+        )
+        assert changed.status_code == 200
+        assert changed.json()["permission_profile"] == "RISK_BASED"
+        assert changed.json()["profile_version"] == 2
+
+
+def test_permission_profile_rejects_contradictory_legacy_create_fields(
+    tmp_path: Path,
+    chat_stack: tuple[Any, ConversationRepository, ChatEventBroker, RunSupervisor, Path],
+) -> None:
+    services, _repository, _broker, _supervisor, project_root = chat_stack
+    with _make_client(services, tmp_path) as client:
+        response = client.post(
+            "/api/chat/conversations",
+            json={
+                "title": "Contradictory permissions",
+                "project_root": str(project_root),
+                "permission_mode": "PROJECT_READ_ONLY",
+                "permission_profile": "ASK_ALWAYS",
+            },
+        )
+
+    assert response.status_code == 422
+
+
+def test_legacy_permission_update_synchronizes_authoritative_profile(
+    tmp_path: Path,
+    chat_stack: tuple[Any, ConversationRepository, ChatEventBroker, RunSupervisor, Path],
+) -> None:
+    services, _repository, _broker, _supervisor, project_root = chat_stack
+    with _make_client(services, tmp_path) as client:
+        created = client.post(
+            "/api/chat/conversations",
+            json={
+                "title": "Legacy client",
+                "project_root": str(project_root),
+                "permission_profile": "PROJECT_READ_ONLY",
+            },
+        )
+        response = client.patch(
+            f"/api/chat/conversations/{created.json()['conversation_id']}",
+            json={"permission_mode": "ASK_FOR_ACCESS"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["permission_mode"] == "ASK_FOR_ACCESS"
+    assert response.json()["permission_profile"] == "ASK_ALWAYS"
+    assert response.json()["profile_version"] == 2
+
+
+def test_permission_profile_v8_migration_normalizes_legacy_value(
+    tmp_path: Path,
+    project_root: Path,
+) -> None:
+    database_path = tmp_path / "legacy.sqlite3"
+    repository = ConversationRepository(database_path)
+    asyncio.run(repository.initialize())
+    conversation = asyncio.run(
+        repository.create_conversation(
+            title="Legacy ask",
+            project_root=project_root,
+            permission_mode=PermissionMode.ASK_FOR_ACCESS,
+        ),
+    )
+
+    with __import__("sqlite3").connect(database_path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        row = connection.execute(
+            "SELECT permission_profile, profile_version FROM conversations "
+            "WHERE conversation_id = ?",
+            (conversation.conversation_id,),
+        ).fetchone()
+
+    assert version == 10
+    assert row == ("ASK_ALWAYS", 1)
+
+
 def test_conversation_activities_endpoint_exact_shape_and_validation(
     tmp_path: Path,
     chat_stack: tuple[Any, ConversationRepository, ChatEventBroker, RunSupervisor, Path],
@@ -1078,3 +1295,266 @@ def test_conversation_activities_endpoint_exact_shape_and_validation(
         missing = client.get(f"/api/chat/conversations/{uuid4()}/activities")
         assert missing.status_code == 404
         assert missing.json() == {"detail": "not found"}
+
+
+def _interrupt_path(conversation_id: str, session_id: str) -> str:
+    return (
+        f"/api/chat/conversations/{conversation_id}/runs/{session_id}/interrupt"
+    )
+
+
+@pytest.mark.asyncio
+async def test_interrupt_hanging_run_returns_interrupted_and_cancels_durable(
+    tmp_path: Path,
+    project_root: Path,
+) -> None:
+    from datetime import UTC, datetime
+
+    from agent_foundations.durable.models import DurableRun, DurableRunStatus
+    from agent_foundations.durable.repository import DurableRunRepository
+
+    ChatServices, create_chat_router = _require_chat_api()
+    database_path = tmp_path / "state" / "chat.sqlite3"
+    repository = ConversationRepository(database_path)
+    await repository.initialize()
+    durable = DurableRunRepository(database_path)
+    await durable.initialize()
+    broker = ChatEventBroker()
+    supervisor = RunSupervisor()
+    runner = ConversationRunner(
+        repository=repository,
+        broker=broker,
+        runtime_factory=_build_runtime_factory(
+            FakeModelProvider([ModelResponse(content="unused")]),
+        ),
+        trace_dir=tmp_path / "traces",
+        redactor_factory=lambda conversation: Redactor(
+            Path(conversation.project_root),
+        ),
+        tool_executor_factory=direct_executor_factory,
+        durable_repository=durable,
+    )
+    services = ChatServices(
+        repository=repository,
+        broker=broker,
+        runner=runner,
+        supervisor=supervisor,
+        coordinator=ApprovalCoordinator(repository, broker),
+        durable_repository=durable,
+    )
+    started = asyncio.Event()
+
+    async def hang() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    conversation = await repository.create_conversation(
+        title="Stop hanging run",
+        project_root=project_root,
+        permission_mode=PermissionMode.PROJECT_READ_ONLY,
+    )
+    _message, run = await repository.begin_run(
+        conversation.conversation_id,
+        content="hang until stop",
+        session_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    )
+    await repository.transition_run(
+        run.session_id,
+        RunStatus.QUEUED,
+        RunStatus.RUNNING,
+    )
+    now = datetime(2026, 9, 9, 12, 0, 0, tzinfo=UTC)
+    await durable.create_run(
+        DurableRun(
+            run_id=run.session_id,
+            project_root=str(project_root),
+            status=DurableRunStatus.RUNNING,
+            schema_version=1,
+            state_version=0,
+            attempt=1,
+            created_at=now,
+            updated_at=now,
+        ),
+    )
+    await supervisor.start(conversation.conversation_id, hang)
+    await started.wait()
+    app = FastAPI()
+    app.include_router(create_chat_router(services), prefix="/api/chat")
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                _interrupt_path(conversation.conversation_id, run.session_id),
+            )
+            assert response.status_code == 200
+            body = response.json()
+            assert body["session_id"] == run.session_id
+            assert body["status"] == "interrupted"
+            assert body["finished_at"] is not None
+            loaded = await repository.get_run(run.session_id)
+            assert loaded.status is RunStatus.INTERRUPTED
+            durable_run = await durable.get_run(run.session_id)
+            assert durable_run.status is DurableRunStatus.CANCELLED
+            assert supervisor.is_active(conversation.conversation_id) is False
+    finally:
+        await supervisor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_waiting_approval_invalidates_session_pending_approval(
+    tmp_path: Path,
+    project_root: Path,
+) -> None:
+    from datetime import UTC, datetime
+
+    from agent_foundations.durable.models import DurableRun, DurableRunStatus
+    from agent_foundations.durable.repository import DurableRunRepository
+
+    ChatServices, create_chat_router = _require_chat_api()
+    database_path = tmp_path / "state" / "chat.sqlite3"
+    repository = ConversationRepository(database_path)
+    await repository.initialize()
+    durable = DurableRunRepository(database_path)
+    await durable.initialize()
+    broker = ChatEventBroker()
+    supervisor = RunSupervisor()
+    runner = ConversationRunner(
+        repository=repository,
+        broker=broker,
+        runtime_factory=_build_runtime_factory(
+            FakeModelProvider([ModelResponse(content="unused")]),
+        ),
+        trace_dir=tmp_path / "traces",
+        redactor_factory=lambda conversation: Redactor(
+            Path(conversation.project_root),
+        ),
+        tool_executor_factory=direct_executor_factory,
+        durable_repository=durable,
+    )
+    services = ChatServices(
+        repository=repository,
+        broker=broker,
+        runner=runner,
+        supervisor=supervisor,
+        coordinator=ApprovalCoordinator(repository, broker),
+        durable_repository=durable,
+    )
+    conversation = await repository.create_conversation(
+        title="Stop waiting approval",
+        project_root=project_root,
+        permission_mode=PermissionMode.PROJECT_READ_ONLY,
+    )
+    other = await repository.create_conversation(
+        title="Other pending",
+        project_root=project_root,
+        permission_mode=PermissionMode.PROJECT_READ_ONLY,
+    )
+    _message, run = await repository.begin_run(
+        conversation.conversation_id,
+        content="needs approval",
+        session_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    )
+    await repository.transition_run(
+        run.session_id,
+        RunStatus.QUEUED,
+        RunStatus.RUNNING,
+    )
+    await repository.transition_run(
+        run.session_id,
+        RunStatus.RUNNING,
+        RunStatus.WAITING_APPROVAL,
+    )
+    approval = await repository.create_approval(
+        conversation_id=conversation.conversation_id,
+        session_id=run.session_id,
+        tool_call_id="call-stop",
+        tool_name="read_file",
+        canonical_path="/tmp/stop.txt",
+    )
+    _other_message, other_run = await repository.begin_run(
+        other.conversation_id,
+        content="other pending",
+        session_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    )
+    await repository.transition_run(
+        other_run.session_id,
+        RunStatus.QUEUED,
+        RunStatus.RUNNING,
+    )
+    await repository.transition_run(
+        other_run.session_id,
+        RunStatus.RUNNING,
+        RunStatus.WAITING_APPROVAL,
+    )
+    other_approval = await repository.create_approval(
+        conversation_id=other.conversation_id,
+        session_id=other_run.session_id,
+        tool_call_id="call-other",
+        tool_name="read_file",
+        canonical_path="/tmp/other.txt",
+    )
+    now = datetime(2026, 9, 9, 12, 0, 0, tzinfo=UTC)
+    await durable.create_run(
+        DurableRun(
+            run_id=run.session_id,
+            project_root=str(project_root),
+            status=DurableRunStatus.WAITING_APPROVAL,
+            schema_version=1,
+            state_version=0,
+            attempt=1,
+            created_at=now,
+            updated_at=now,
+        ),
+    )
+    app = FastAPI()
+    app.include_router(create_chat_router(services), prefix="/api/chat")
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            missing_conversation = await client.post(
+                _interrupt_path(str(uuid4()), run.session_id),
+            )
+            assert missing_conversation.status_code == 404
+            assert missing_conversation.json() == {"detail": "not found"}
+            missing_run = await client.post(
+                _interrupt_path(conversation.conversation_id, str(uuid4())),
+            )
+            assert missing_run.status_code == 404
+            assert missing_run.json() == {"detail": "not found"}
+            mismatch = await client.post(
+                _interrupt_path(other.conversation_id, run.session_id),
+            )
+            assert mismatch.status_code == 409
+            assert mismatch.json() == {"detail": "conflict"}
+            malformed = await client.post(
+                "/api/chat/conversations/not-a-uuid/runs/not-a-uuid/interrupt",
+            )
+            assert malformed.status_code == 422
+
+            response = await client.post(
+                _interrupt_path(conversation.conversation_id, run.session_id),
+            )
+            assert response.status_code == 200
+            assert response.json()["status"] == "interrupted"
+            loaded = await repository.get_run(run.session_id)
+            assert loaded.status is RunStatus.INTERRUPTED
+            assert (await repository.get_approval(approval.approval_id)).status is (
+                ApprovalStatus.INVALIDATED
+            )
+            assert (await repository.get_approval(other_approval.approval_id)).status is (
+                ApprovalStatus.PENDING
+            )
+            assert (await durable.get_run(run.session_id)).status is (
+                DurableRunStatus.CANCELLED
+            )
+            completed = await client.post(
+                _interrupt_path(conversation.conversation_id, run.session_id),
+            )
+            assert completed.status_code == 409
+            assert completed.json() == {"detail": "conflict"}
+    finally:
+        await supervisor.shutdown()

@@ -452,4 +452,13 @@ async def test_conversation_repository_constructor_remains_compatible(
     repository = ConversationRepository(tmp_path / "chat.sqlite3")
     await repository.initialize()
     with repository._connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert "command_output_artifacts" in tables
+        assert "command_output_reads" in tables
+        assert b"fixture-secret" not in (tmp_path / "chat.sqlite3").read_bytes()

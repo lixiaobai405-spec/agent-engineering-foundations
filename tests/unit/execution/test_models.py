@@ -114,6 +114,18 @@ def test_request_rejects_unsafe_cwd(cwd: str) -> None:
         _request(cwd=cwd)
 
 
+def test_request_env_defaults_empty_and_rejects_unsafe_pairs() -> None:
+    with pytest.raises(ValidationError):
+        _request(env=(("GIT_CONFIG_GLOBAL", "/tmp/x\n"),))
+    with pytest.raises(ValidationError):
+        _request(env=(("", "value"),))
+    with pytest.raises(ValidationError):
+        _request(env=(("BAD KEY", "value"),))
+    request = _request(env=(("GIT_OPTIONAL_LOCKS", "0"),))
+    assert request.env == (("GIT_OPTIONAL_LOCKS", "0"),)
+    assert _request().env == ()
+
+
 def test_request_rejects_invalid_mount_mode_and_resource_limits() -> None:
     _ExecutionRequest, _ExecutionResult, max_stdin, max_timeout, max_output = _models()
     invalid = (

@@ -1,5 +1,12 @@
 export type PermissionMode = "PROJECT_READ_ONLY" | "ASK_FOR_ACCESS";
 
+export type PermissionProfile =
+  | "PROJECT_READ_ONLY"
+  | "ASK_ALWAYS"
+  | "RISK_BASED"
+  | "PROJECT_FULL_ACCESS"
+  | "CUSTOM";
+
 export type MessageRole = "user" | "assistant";
 
 export type RunStatus =
@@ -30,7 +37,8 @@ export type ChatEventType =
   | "approval.resolved"
   | "assistant.message.completed"
   | "run.completed"
-  | "run.failed";
+  | "run.failed"
+  | "plan.updated";
 
 export const CHAT_EVENT_TYPES: readonly ChatEventType[] = [
   "run.started",
@@ -43,6 +51,7 @@ export const CHAT_EVENT_TYPES: readonly ChatEventType[] = [
   "assistant.message.completed",
   "run.completed",
   "run.failed",
+  "plan.updated",
 ] as const;
 
 export interface Conversation {
@@ -50,6 +59,8 @@ export interface Conversation {
   title: string;
   project_root: string;
   permission_mode: PermissionMode;
+  permission_profile: PermissionProfile;
+  profile_version: number;
   created_at: string;
   updated_at: string;
 }
@@ -116,19 +127,24 @@ export interface ActiveApproval {
   tool_call_id: string;
   tool_name: string;
   canonical_path: string;
-  operation: "read";
-  scope: "external_exact_path";
+  operation: "read" | "apply" | "run";
+  scope: "external_exact_path" | "project_internal";
+  policy_decision?: "allow" | "ask" | "deny";
+  resource_kind?: string;
+  one_time?: boolean;
+  backend?: "docker";
+  patch?: PatchPreviewState;
 }
 
 export interface CreateConversationRequest {
   title: string;
   project_root: string;
-  permission_mode: PermissionMode;
+  permission_profile: PermissionProfile;
 }
 
 export interface PatchConversationRequest {
   title?: string;
-  permission_mode?: PermissionMode;
+  permission_profile?: PermissionProfile;
 }
 
 export interface PostMessageRequest {
@@ -150,13 +166,45 @@ export interface PendingApprovalState {
   tool_call_id: string;
   tool_name: string;
   canonical_path: string;
-  operation: "read";
-  scope: "external_exact_path";
+  operation: "read" | "apply" | "run";
+  resource_kind: string;
+  scope: "external_exact_path" | "project_internal";
+  policy_decision: "allow" | "ask" | "deny";
   status: "pending";
   requested_at: string;
+}
+
+export interface PatchFileSummary {
+  path: string;
+  operation: "modify" | "create";
+  hunk_count: number;
+  baseline_status: "matched" | "new" | "stale";
+  summary: string;
+}
+
+export interface PatchPreviewState {
+  patch_id: string;
+  files: PatchFileSummary[];
+}
+
+export interface ConversationPlanStep {
+  step_id: string;
+  status: string;
+  description: string;
+}
+
+export interface ConversationPlanState {
+  plan_id: string;
+  version: number;
+  goal: string;
+  replan_count: number;
+  max_replans: number;
+  steps: ConversationPlanStep[];
 }
 
 export interface ConversationStateResponse {
   latest_run: RunRecord | null;
   pending_approval: PendingApprovalState | null;
+  patch_preview?: PatchPreviewState | null;
+  plan?: ConversationPlanState | null;
 }

@@ -15,6 +15,8 @@ const CONVERSATION_A: Conversation = {
   title: "Runtime study",
   project_root: "D:\\project",
   permission_mode: "PROJECT_READ_ONLY",
+  permission_profile: "PROJECT_READ_ONLY",
+  profile_version: 1,
   created_at: "2026-08-02T00:00:00Z",
   updated_at: "2026-08-02T00:00:00Z",
 };
@@ -24,6 +26,8 @@ const CONVERSATION_B: Conversation = {
   title: "External access",
   project_root: "D:\\other",
   permission_mode: "ASK_FOR_ACCESS",
+  permission_profile: "ASK_ALWAYS",
+  profile_version: 1,
   created_at: "2026-08-02T00:00:00Z",
   updated_at: "2026-08-02T00:01:00Z",
 };
@@ -313,7 +317,7 @@ describe("reduceChatState", () => {
     expect(messages[0]?.message_id).toBe(assistantMessage.message_id);
   });
 
-  it("enters waiting state on approval.requested", () => {
+  it("enters waiting state but waits for HTTP approval truth", () => {
     const selected = selectConversation(loadConversations([CONVERSATION_A]), CONVERSATION_A.conversation_id);
     const next = reduceChatState(selected, {
       type: "event.received",
@@ -331,14 +335,7 @@ describe("reduceChatState", () => {
       }),
     });
     expect(next.runStatusByConversation[CONVERSATION_A.conversation_id]).toBe("waiting_approval");
-    expect(next.activeApprovalByConversation[CONVERSATION_A.conversation_id]).toEqual({
-      approval_id: "44444444-4444-4444-8444-444444444444",
-      tool_call_id: "call-1",
-      tool_name: "read_file",
-      canonical_path: "/tmp/external.txt",
-      operation: "read",
-      scope: "external_exact_path",
-    });
+    expect(next.activeApprovalByConversation[CONVERSATION_A.conversation_id]).toBeNull();
   });
 
   it("clears active approval on approval.resolved", () => {
@@ -537,7 +534,9 @@ describe("conversation.state.loaded HTTP recovery", () => {
     tool_name: "read_file",
     canonical_path: "/tmp/external.txt",
     operation: "read" as const,
+    resource_kind: "project_path",
     scope: "external_exact_path" as const,
+    policy_decision: "ask" as const,
     status: "pending" as const,
     requested_at: "2026-08-02T00:00:01Z",
   };
@@ -578,6 +577,85 @@ describe("conversation.state.loaded HTTP recovery", () => {
       canonical_path: PENDING_APPROVAL.canonical_path,
       operation: "read",
       scope: "external_exact_path",
+      policy_decision: "ask",
+      resource_kind: "project_path",
+    });
+  });
+
+  it("restores an apply approval with its bounded patch preview", () => {
+    const selected = selectConversation(
+      loadConversations([CONVERSATION_A]),
+      CONVERSATION_A.conversation_id,
+    );
+    const waitingRun = { ...RUNNING_RUN, status: "waiting_approval" as const };
+    const next = reduceChatState(selected, {
+      type: "conversation.state.loaded",
+      conversationId: CONVERSATION_A.conversation_id,
+      state: {
+        latest_run: waitingRun,
+        pending_approval: {
+          ...PENDING_APPROVAL,
+          tool_name: "apply_patch",
+          canonical_path: "patch:0123456789abcdef",
+          operation: "apply",
+          resource_kind: "project_path",
+          scope: "project_internal",
+        },
+        patch_preview: {
+          patch_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          files: [
+            {
+              path: "README.md",
+              operation: "modify",
+              hunk_count: 1,
+              baseline_status: "matched",
+              summary: "+1 -1",
+            },
+          ],
+        },
+      },
+    });
+
+    expect(next.activeApprovalByConversation[CONVERSATION_A.conversation_id]).toMatchObject({
+      operation: "apply",
+      scope: "project_internal",
+      policy_decision: "ask",
+      resource_kind: "project_path",
+      patch: { files: [{ path: "README.md", summary: "+1 -1" }] },
+    });
+  });
+
+  it("restores run_command pending approval from HTTP policy fields", () => {
+    const selected = selectConversation(
+      loadConversations([CONVERSATION_A]),
+      CONVERSATION_A.conversation_id,
+    );
+    const waitingRun = { ...RUNNING_RUN, status: "waiting_approval" as const };
+    const next = reduceChatState(selected, {
+      type: "conversation.state.loaded",
+      conversationId: CONVERSATION_A.conversation_id,
+      state: {
+        latest_run: waitingRun,
+        pending_approval: {
+          ...PENDING_APPROVAL,
+          tool_name: "run_command",
+          canonical_path: "command:run_command",
+          operation: "run",
+          resource_kind: "sandbox_command",
+          scope: "project_internal",
+          policy_decision: "ask",
+        },
+      },
+    });
+    expect(next.activeApprovalByConversation[CONVERSATION_A.conversation_id]).toEqual({
+      approval_id: PENDING_APPROVAL.approval_id,
+      tool_call_id: PENDING_APPROVAL.tool_call_id,
+      tool_name: "run_command",
+      canonical_path: "command:run_command",
+      operation: "run",
+      resource_kind: "sandbox_command",
+      scope: "project_internal",
+      policy_decision: "ask",
     });
   });
 

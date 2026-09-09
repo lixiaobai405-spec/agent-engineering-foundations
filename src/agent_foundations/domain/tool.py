@@ -41,6 +41,7 @@ class ToolCall(ValidatedCopyModel):
         PlainSerializer(_serialize_frozen, return_type=dict[str, Any]),
         WithJsonSchema({"type": "object"}),
     ]
+    argument_parse_error: str | None = None
 
 
 class ToolDefinition(ValidatedCopyModel):

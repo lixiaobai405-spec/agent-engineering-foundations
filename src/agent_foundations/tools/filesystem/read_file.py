@@ -1,9 +1,12 @@
+import hashlib
+from pathlib import Path
 from typing import Any
 
 from agent_foundations.domain.errors import BinaryFileError, FileTooLargeError
 from agent_foundations.domain.tool import ToolResult
 from agent_foundations.security.models import SideEffectKind, ToolManifest
 from agent_foundations.tools.filesystem.path_policy import PathPolicy
+from agent_foundations.tools.utf8_lines import utf8_line_texts
 
 READ_FILE_MANIFEST = ToolManifest(
     name="read_file",
@@ -16,7 +19,11 @@ READ_FILE_MANIFEST = ToolManifest(
 
 class ReadFileTool:
     name = "read_file"
-    description = "Read a bounded UTF-8 line range from a project-relative text file."
+    description = (
+        "Read a bounded UTF-8 line range from a project-relative text file. "
+        "Successful metadata includes sha256, size_bytes, encoding, and truncated; "
+        "sha256 is the full-file digest."
+    )
 
     def __init__(self, policy: PathPolicy, max_bytes: int = 256_000) -> None:
         if max_bytes < 1:
@@ -45,7 +52,8 @@ class ReadFileTool:
                 content="path is not a file",
                 error_code="not_file",
             )
-        lines = self.read_lines(relative_path)
+        raw = self._read_raw_bytes(path)
+        lines = utf8_line_texts(raw)
         start = int(arguments.get("start_line", 1)) - 1
         maximum = int(arguments.get("max_lines", 200))
         selected = lines[start : start + maximum]
@@ -61,6 +69,9 @@ class ReadFileTool:
                 "start_line": start + 1,
                 "returned_lines": len(selected),
                 "truncated": start + len(selected) < len(lines),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "size_bytes": len(raw),
+                "encoding": "utf-8",
             },
         )
 
@@ -69,6 +80,10 @@ class ReadFileTool:
         path = self._policy.authorize(relative_path)
         if not path.is_file():
             raise BinaryFileError("path is not a regular text file")
+        raw = self._read_raw_bytes(path)
+        return utf8_line_texts(raw)
+
+    def _read_raw_bytes(self, path: Path) -> bytes:
         with path.open("rb") as stream:
             raw = stream.read(self._max_bytes + 1)
         if len(raw) > self._max_bytes:
@@ -78,6 +93,7 @@ class ReadFileTool:
         if b"\x00" in raw:
             raise BinaryFileError("file contains NUL bytes")
         try:
-            return tuple(raw.decode("utf-8").splitlines())
+            raw.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise BinaryFileError("file is not valid UTF-8 text") from exc
+        return raw

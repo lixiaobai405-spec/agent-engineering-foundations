@@ -1,0 +1,10 @@
+{
+  "name": "phase2-3x3-node-fixture",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:chat": "vitest run",
+    "typecheck:chat": "tsc --noEmit",
+    "build:chat": "vite build"
+  }
+}

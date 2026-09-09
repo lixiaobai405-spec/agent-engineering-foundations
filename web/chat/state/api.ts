@@ -131,6 +131,18 @@ export async function postMessage(
   );
 }
 
+export async function interruptRun(
+  conversationId: string,
+  sessionId: string,
+): Promise<RunRecord> {
+  return requestJson<RunRecord>(
+    chatUrl(
+      `/conversations/${encodeId(conversationId)}/runs/${encodeId(sessionId)}/interrupt`,
+    ),
+    { method: "POST" },
+  );
+}
+
 export async function getRun(sessionId: string): Promise<RunRecord> {
   return requestJson<RunRecord>(chatUrl(`/runs/${encodeId(sessionId)}`));
 }
@@ -159,6 +171,43 @@ export async function decideApproval(
 
 export function conversationEventsUrl(conversationId: string): string {
   return chatUrl(`/conversations/${encodeId(conversationId)}/events`);
+}
+
+export async function fetchCommandOutputPage(
+  conversationId: string,
+  sessionId: string,
+  artifactId: string,
+  params: { stream: "stdout" | "stderr"; startLine: number; lineCount: number },
+): Promise<{ lines: string[]; artifact_id: string }> {
+  const query = new URLSearchParams({
+    stream: params.stream,
+    start_line: String(params.startLine),
+    line_count: String(params.lineCount),
+  });
+  return requestJson(
+    chatUrl(
+      `/conversations/${encodeId(conversationId)}/runs/${encodeId(sessionId)}/command-artifacts/${encodeId(artifactId)}/pages?${query.toString()}`,
+    ),
+  );
+}
+
+export async function createCommandOutputDownloadTicket(
+  conversationId: string,
+  sessionId: string,
+  artifactId: string,
+): Promise<{ ticket: string }> {
+  return requestJson(
+    chatUrl(
+      `/conversations/${encodeId(conversationId)}/runs/${encodeId(sessionId)}/command-artifacts/${encodeId(artifactId)}/download-tickets`,
+    ),
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: window.location.origin,
+      },
+    },
+  );
 }
 
 export type { ChatEvent };

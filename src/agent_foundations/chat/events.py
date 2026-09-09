@@ -23,11 +23,21 @@ _TRACE_TO_CHAT_TYPE: dict[str, ChatEventType] = {
     "tool.call.requested": ChatEventType.TOOL_REQUESTED,
     "tool.call.completed": ChatEventType.TOOL_COMPLETED,
     "tool.call.failed": ChatEventType.TOOL_FAILED,
+    "plan.created": ChatEventType.PLAN_UPDATED,
+    "plan.step.updated": ChatEventType.PLAN_UPDATED,
+    "plan.replanned": ChatEventType.PLAN_UPDATED,
 }
 
 _ALLOWED_DATA_KEYS = frozenset(
     {"tool_call_id", "name", "arguments_summary", "result_summary", "status"},
 )
+_PLAN_TRACE_TYPES = frozenset(
+    {"plan.created", "plan.step.updated", "plan.replanned"},
+)
+_ALLOWED_PLAN_DATA_KEYS = frozenset(
+    {"plan_id", "version", "goal", "replan_count", "max_replans", "steps"},
+)
+_ALLOWED_PLAN_STEP_KEYS = frozenset({"step_id", "status", "description"})
 _PROJECT_ROOT_PLACEHOLDER = "<PROJECT_ROOT>"
 logger = logging.getLogger(__name__)
 
@@ -102,6 +112,13 @@ def _summarize_arguments(
         return _safe_path_summary(arguments.get("path", "."), project_root)
     if name == "search_text":
         return f"query={_safe_scalar(arguments.get('query'))}"
+    if name == "run_command":
+        argv = arguments.get("argv")
+        if isinstance(argv, list):
+            return " ".join(str(item) for item in argv[:6])
+        return "run_command"
+    if name in {"read_command_output", "search_command_output"}:
+        return f"artifact={_safe_scalar(arguments.get('artifact_id'))}"
     return "arguments hidden"
 
 
@@ -125,7 +142,65 @@ def _summarize_result(name: str, result: Mapping[str, Any]) -> str:
         count = len(matches) if isinstance(matches, list) else 0
         scanned = _safe_count(payload.get("scanned_files"))
         return f"{_count_label(count, 'match', 'matches')} in {scanned} files"
+    if name == "run_command":
+        metadata = result.get("metadata") if isinstance(result.get("metadata"), Mapping) else {}
+        artifact = ""
+        if isinstance(metadata, Mapping):
+            artifact = _safe_scalar(metadata.get("artifact_id"))
+        exit_code = metadata.get("exit_code") if isinstance(metadata, Mapping) else None
+        failed = metadata.get("failed") if isinstance(metadata, Mapping) else None
+        parser = metadata.get("parser_status") if isinstance(metadata, Mapping) else None
+        return f"exit={exit_code} failed={failed} parser={parser} artifact={artifact}"
+    if name in {"read_command_output", "search_command_output"}:
+        metadata = result.get("metadata") if isinstance(result.get("metadata"), Mapping) else {}
+        artifact_id = ""
+        output_count: object = None
+        if isinstance(metadata, Mapping):
+            raw_artifact = metadata.get("artifact_id")
+            if isinstance(raw_artifact, str):
+                artifact_id = raw_artifact
+            output_count = metadata.get("line_count", metadata.get("hits"))
+        hit_count = (
+            len(output_count) if isinstance(output_count, list) else output_count
+        )
+        return f"artifact={artifact_id} count={hit_count}"
     return "completed"
+
+
+def _plan_step_view(step: Mapping[str, Any]) -> dict[str, str] | None:
+    item: dict[str, str] = {}
+    for key in _ALLOWED_PLAN_STEP_KEYS:
+        value = step.get(key)
+        if isinstance(value, str) and value:
+            item[key] = value
+    if {"step_id", "status", "description"} <= item.keys():
+        return item
+    return None
+
+
+def _plan_event_data(payload: Mapping[str, Any]) -> dict[str, Any]:
+    data: dict[str, Any] = {}
+    plan_id = payload.get("plan_id")
+    if isinstance(plan_id, str) and plan_id:
+        data["plan_id"] = plan_id
+    goal = payload.get("goal")
+    if isinstance(goal, str) and goal:
+        data["goal"] = goal
+    for key in ("version", "replan_count", "max_replans"):
+        value = payload.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            data[key] = value
+    steps = payload.get("steps")
+    if isinstance(steps, list):
+        cleaned: list[dict[str, str]] = []
+        for step in steps:
+            if not isinstance(step, Mapping):
+                continue
+            item = _plan_step_view(step)
+            if item is not None:
+                cleaned.append(item)
+        data["steps"] = cleaned
+    return {key: value for key, value in data.items() if key in _ALLOWED_PLAN_DATA_KEYS}
 
 
 class TraceToChatProjector:
@@ -171,6 +246,9 @@ class TraceToChatProjector:
         status: Any,
     ) -> FrozenJSON:
         data: dict[str, Any] = {}
+        if event_type in _PLAN_TRACE_TYPES:
+            return FrozenJSON(_plan_event_data(payload))
+
         if isinstance(status, str) and status:
             data["status"] = _truncate_summary(status, self._max_summary_chars)
 
@@ -297,6 +375,10 @@ class ChatEventBroker:
                 queue.get_nowait()
             queue.put_nowait(event)
 
+    def subscriber_count(self, conversation_id: str) -> int:
+        queues = self._subscribers.get(conversation_id)
+        return 0 if queues is None else len(queues)
+
     async def subscribe(
         self,
         conversation_id: str,
@@ -315,6 +397,22 @@ class ChatEventBroker:
 
 
 def encode_chat_sse(event: ChatEvent) -> str:
+    if (
+        event.type is ChatEventType.APPROVAL_REQUESTED
+        and event.data.get("tool_name") == "apply_patch"
+    ):
+        safe_data = dict(event.data)
+        safe_data.update(
+            {
+                "operation": "apply",
+                "scope": "project_internal",
+                "policy_decision": "ask",
+                "resource_kind": "project_path",
+                "one_time": True,
+                "backend": "docker",
+            },
+        )
+        event = event.model_copy(update={"data": safe_data})
     return (
         f"event: {event.type.value}\n"
         f"data: {event.model_dump_json()}\n\n"

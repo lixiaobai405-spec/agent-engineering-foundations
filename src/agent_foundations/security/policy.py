@@ -11,7 +11,9 @@ from agent_foundations.security.models import (
     SideEffectKind,
 )
 
-_BUILTIN_READ_RESOURCE_KINDS = frozenset({"project_path", "plan", "patch_proposal"})
+_BUILTIN_READ_RESOURCE_KINDS = frozenset(
+    {"project_path", "plan", "patch_proposal", "command_artifact"}
+)
 _KNOWN_RESOURCE_KINDS = _BUILTIN_READ_RESOURCE_KINDS | frozenset(
     {"sandbox_command", "network", "system"},
 )
@@ -169,6 +171,9 @@ def _builtin_matrix_outcome(
         and resource.kind == "sandbox_command"
         and manifest.sandbox_required
     ):
+        return _sandbox_command_outcome(profile_name)
+
+    if resource.kind == "command_artifact" and request.operation in {"read", "search"}:
         return _sandbox_command_outcome(profile_name)
 
     if (

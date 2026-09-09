@@ -84,6 +84,7 @@ def test_legacy_run_state_json_defaults_phase_and_tool_index() -> None:
     assert state.phase == AgentRunPhase.READY_FOR_MODEL
     assert state.next_tool_index == 0
     assert state.final_answer is None
+    assert dict(state.provider_attempts) == {}
 
 
 def test_checkpoint_reason_order_is_stable() -> None:
@@ -94,6 +95,7 @@ def test_checkpoint_reason_order_is_stable() -> None:
         "plan_update",
         "finalizing",
         "retry_started",
+        "provider_attempt",
     )
 
 

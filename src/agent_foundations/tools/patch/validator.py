@@ -18,6 +18,7 @@ from agent_foundations.tools.patch.models import (
     compute_project_root_fingerprint,
 )
 from agent_foundations.tools.patch.parser import ParsedPatch, PatchParseError
+from agent_foundations.tools.utf8_lines import utf8_file_lines
 
 
 class PatchValidationError(ValueError):
@@ -281,18 +282,7 @@ def _validate_modify_hunk_topology(
 
 
 def _file_lines_for_hunks(raw: bytes) -> list[tuple[str, bool]]:
-    text = raw.decode("utf-8")
-    ends_without_newline = not text.endswith("\n") and text != ""
-    lines = text.split("\n")
-    if ends_without_newline:
-        result = [(line, index < len(lines) - 1) for index, line in enumerate(lines)]
-        if lines:
-            last_text, _ = result[-1]
-            result[-1] = (last_text, False)
-        return result
-    if lines and lines[-1] == "":
-        lines = lines[:-1]
-    return [(line, True) for line in lines]
+    return utf8_file_lines(raw)
 
 
 def _verify_modify_hunks(

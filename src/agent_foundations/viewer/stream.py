@@ -8,6 +8,10 @@ class EventBroker:
     def __init__(self) -> None:
         self._subscribers: dict[str, set[asyncio.Queue[TraceEvent]]] = {}
 
+    def subscriber_count(self, session_id: str) -> int:
+        queues = self._subscribers.get(session_id)
+        return 0 if queues is None else len(queues)
+
     async def publish(self, event: TraceEvent) -> None:
         targets: set[asyncio.Queue[TraceEvent]] = set()
         session_queues = self._subscribers.get(event.session_id)

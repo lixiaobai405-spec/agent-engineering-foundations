@@ -1,5 +1,6 @@
+import inspect
 import sqlite3
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,6 +25,7 @@ from agent_foundations.chat.repository import (
     ConversationRepository,
     UnsupportedSchemaVersionError,
 )
+from agent_foundations.security.models import PermissionProfileName
 from agent_foundations.storage.migrations import Migration
 
 CONVERSATION_ID_A = "11111111-1111-4111-8111-111111111111"
@@ -331,7 +333,7 @@ async def test_schema_enables_foreign_keys_and_version(tmp_path: Path) -> None:
     repository = ConversationRepository(path)
     await repository.initialize()
     with repository._connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 
@@ -393,7 +395,10 @@ async def test_initialize_migrates_v1_database_to_v2_without_rewriting_data(
             session_id=SESSION_ID,
         )
         preservation_queries = {
-            "conversations": "SELECT * FROM conversations ORDER BY rowid",
+            "conversations": (
+                "SELECT conversation_id, title, project_root, permission_mode, "
+                "created_at, updated_at FROM conversations ORDER BY rowid"
+            ),
             "messages": "SELECT * FROM messages ORDER BY rowid",
             "runs": "SELECT * FROM runs ORDER BY rowid",
             "approval_requests": "SELECT * FROM approval_requests ORDER BY rowid",
@@ -402,6 +407,8 @@ async def test_initialize_migrates_v1_database_to_v2_without_rewriting_data(
             table: [tuple(row) for row in connection.execute(query)]
             for table, query in preservation_queries.items()
         }
+        connection.execute("DROP TABLE IF EXISTS command_output_reads")
+        connection.execute("DROP TABLE IF EXISTS command_output_artifacts")
         connection.execute("DROP TABLE IF EXISTS capabilities")
         connection.execute("DROP TABLE IF EXISTS authorization_requests")
         connection.execute("DROP INDEX IF EXISTS idx_chat_tool_activities_session_started")
@@ -411,6 +418,8 @@ async def test_initialize_migrates_v1_database_to_v2_without_rewriting_data(
         connection.execute("DROP TABLE IF EXISTS run_leases")
         connection.execute("DROP TABLE IF EXISTS run_checkpoints")
         connection.execute("DROP TABLE IF EXISTS durable_runs")
+        connection.execute("ALTER TABLE conversations DROP COLUMN permission_profile")
+        connection.execute("ALTER TABLE conversations DROP COLUMN profile_version")
         connection.execute("PRAGMA user_version = 1")
         connection.commit()
 
@@ -429,12 +438,14 @@ async def test_initialize_migrates_v1_database_to_v2_without_rewriting_data(
             table: [tuple(row) for row in connection.execute(query)]
             for table, query in preservation_queries.items()
         }
-    assert version == 7
+    assert version == 10
     assert "chat_tool_activities" in tables
     assert "durable_runs" in tables
     assert "run_leases" in tables
     assert "side_effects" in tables
     assert "patch_proposals" in tables
+    assert "command_output_artifacts" in tables
+    assert "command_output_reads" in tables
     assert await migrated.get_conversation(created.conversation_id) == created
     assert preserved_after == preserved_before
 
@@ -619,7 +630,7 @@ async def test_initialize_rejects_newer_schema_version(tmp_path: Path) -> None:
     repository = ConversationRepository(path)
     await repository.initialize()
     with repository._connect() as connection:
-        connection.execute("PRAGMA user_version = 8")
+        connection.execute("PRAGMA user_version = 11")
         connection.commit()
     with pytest.raises(UnsupportedSchemaVersionError):
         await repository.initialize()
@@ -888,8 +899,11 @@ async def test_update_permission_mode_uses_single_connection(
         created.conversation_id,
         "Updated title",
         PermissionMode.ASK_FOR_ACCESS,
+        PermissionProfileName.ASK_ALWAYS,
     )
     assert updated.permission_mode is PermissionMode.ASK_FOR_ACCESS
+    assert updated.permission_profile is PermissionProfileName.ASK_ALWAYS
+    assert updated.profile_version == 2
     assert len(connection_ids) == 1
 
 
@@ -2118,6 +2132,243 @@ async def test_get_conversation_state_does_not_leak_other_conversation(
 
     assert latest_run is None
     assert pending_approval is None
+
+
+async def _open_durable(path: Path) -> Any:
+    from agent_foundations.durable.repository import DurableRunRepository
+
+    durable = DurableRunRepository(path)
+    await durable.initialize()
+    return durable
+
+
+def _durable_run(run_id: str, project_root: Path, status: Any) -> Any:
+    from agent_foundations.durable.models import DurableRun
+
+    return DurableRun(
+        run_id=run_id,
+        project_root=str(project_root),
+        status=status,
+        schema_version=1,
+        state_version=0,
+        attempt=1,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+async def _begin_running_run(
+    repository: ConversationRepository,
+    conversation_id: str,
+    session_id: str,
+) -> Any:
+    _, run = await repository.begin_run(
+        conversation_id,
+        content="interrupt durable",
+        session_id=session_id,
+    )
+    await repository.transition_run(
+        run.session_id,
+        RunStatus.QUEUED,
+        RunStatus.RUNNING,
+    )
+    return run
+
+
+async def _interrupt_unfinished_with_optional_durable(
+    repository: ConversationRepository,
+    durable: Any | None,
+) -> tuple[int, int]:
+    kwargs: dict[str, Any] = {}
+    parameters = inspect.signature(repository.interrupt_unfinished).parameters
+    if durable is not None and "durable_repository" in parameters:
+        kwargs["durable_repository"] = durable
+    return await repository.interrupt_unfinished(**kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "durable_status",
+    ["created", "running", "waiting_approval", "paused"],
+)
+async def test_interrupt_unfinished_cancels_cancelable_durable(
+    tmp_path: Path,
+    durable_status: str,
+) -> None:
+    from agent_foundations.durable.models import DurableRunStatus
+
+    database_path = tmp_path / "chat.sqlite3"
+    repository = await _open_repository(database_path)
+    durable = await _open_durable(database_path)
+    conversation_id = await _create_conversation(repository, tmp_path)
+    run = await _begin_running_run(repository, conversation_id, SESSION_ID)
+    await durable.create_run(
+        _durable_run(run.session_id, tmp_path, DurableRunStatus(durable_status)),
+    )
+
+    interrupted_runs, invalidated_approvals = (
+        await _interrupt_unfinished_with_optional_durable(repository, durable)
+    )
+
+    assert interrupted_runs == 1
+    assert invalidated_approvals == 0
+    assert (await repository.get_run(run.session_id)).status is RunStatus.INTERRUPTED
+    assert (await durable.get_run(run.session_id)).status is DurableRunStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("durable_status", ["completed", "failed", "cancelled"])
+async def test_interrupt_unfinished_skips_terminal_durable(
+    tmp_path: Path,
+    durable_status: str,
+) -> None:
+    from agent_foundations.durable.models import DurableRunStatus
+
+    database_path = tmp_path / "chat.sqlite3"
+    repository = await _open_repository(database_path)
+    durable = await _open_durable(database_path)
+    conversation_id = await _create_conversation(repository, tmp_path)
+    run = await _begin_running_run(repository, conversation_id, SESSION_ID)
+    expected = DurableRunStatus(durable_status)
+    await durable.create_run(_durable_run(run.session_id, tmp_path, expected))
+
+    interrupted_runs, invalidated_approvals = (
+        await _interrupt_unfinished_with_optional_durable(repository, durable)
+    )
+
+    assert interrupted_runs == 1
+    assert invalidated_approvals == 0
+    assert (await repository.get_run(run.session_id)).status is RunStatus.INTERRUPTED
+    assert (await durable.get_run(run.session_id)).status is expected
+
+
+@pytest.mark.asyncio
+async def test_interrupt_unfinished_skips_missing_durable_row(tmp_path: Path) -> None:
+    database_path = tmp_path / "chat.sqlite3"
+    repository = await _open_repository(database_path)
+    durable = await _open_durable(database_path)
+    conversation_id = await _create_conversation(repository, tmp_path)
+    run = await _begin_running_run(repository, conversation_id, SESSION_ID)
+
+    interrupted_runs, invalidated_approvals = (
+        await _interrupt_unfinished_with_optional_durable(repository, durable)
+    )
+
+    assert interrupted_runs == 1
+    assert invalidated_approvals == 0
+    assert (await repository.get_run(run.session_id)).status is RunStatus.INTERRUPTED
+    from agent_foundations.durable.repository import DurableRunNotFoundError
+
+    with pytest.raises(DurableRunNotFoundError):
+        await durable.get_run(run.session_id)
+
+
+@pytest.mark.asyncio
+async def test_interrupt_unfinished_without_durable_leaves_durable_running(
+    tmp_path: Path,
+) -> None:
+    from agent_foundations.durable.models import DurableRunStatus
+
+    database_path = tmp_path / "chat.sqlite3"
+    repository = await _open_repository(database_path)
+    durable = await _open_durable(database_path)
+    conversation_id = await _create_conversation(repository, tmp_path)
+    run = await _begin_running_run(repository, conversation_id, SESSION_ID)
+    await durable.create_run(
+        _durable_run(run.session_id, tmp_path, DurableRunStatus.RUNNING),
+    )
+
+    assert await repository.interrupt_unfinished() == (1, 0)
+    assert (await repository.get_run(run.session_id)).status is RunStatus.INTERRUPTED
+    assert (await durable.get_run(run.session_id)).status is DurableRunStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_interrupt_unfinished_does_not_reapply_committed_apply_patch(
+    tmp_path: Path,
+) -> None:
+    from agent_foundations.domain.tool import Tool, ToolResult
+    from agent_foundations.durable.effects import SideEffectLedger
+    from agent_foundations.durable.models import DurableRunStatus, SideEffectIntent
+    from agent_foundations.runtime.tool_execution import (
+        IdempotentToolCallExecutor,
+        ToolExecutionContext,
+    )
+
+    database_path = tmp_path / "chat.sqlite3"
+    repository = await _open_repository(database_path)
+    durable = await _open_durable(database_path)
+    conversation_id = await _create_conversation(repository, tmp_path)
+    run = await _begin_running_run(repository, conversation_id, SESSION_ID)
+    await durable.create_run(
+        _durable_run(run.session_id, tmp_path, DurableRunStatus.RUNNING),
+    )
+
+    class ApplyCounterTool:
+        name = "apply_patch"
+        description = "count downstream apply"
+        count = 0
+
+        def input_schema(self) -> dict[str, Any]:
+            return {"type": "object", "properties": {"path": {"type": "string"}}}
+
+        async def execute(self, arguments: dict[str, Any]) -> ToolResult:
+            self.count += 1
+            return ToolResult(success=True, content=f"applied:{arguments.get('path', '')}")
+
+    class WriteClassifier:
+        def describe(
+            self,
+            tool: Any,
+            arguments: Mapping[str, Any],
+            context: ToolExecutionContext,
+        ) -> SideEffectIntent:
+            path = str(arguments.get("path", "resource"))
+            return SideEffectIntent(
+                operation="write",
+                resource_key=path,
+                summary=f"write {path}",
+            )
+
+    class CountingDownstream:
+        async def execute(
+            self,
+            tool: Tool,
+            arguments: dict[str, Any],
+            context: ToolExecutionContext,
+        ) -> ToolResult:
+            return await tool.execute(arguments)
+
+    ledger = SideEffectLedger(durable, clock=lambda: NOW)
+    tool = ApplyCounterTool()
+    executor = IdempotentToolCallExecutor(
+        CountingDownstream(),
+        WriteClassifier(),
+        ledger,
+        execution_owner_id="owner-1",
+    )
+    context = ToolExecutionContext(
+        session_id=run.session_id,
+        root=tmp_path,
+        tool_call_id="call-apply-1",
+        tool_name="apply_patch",
+    )
+    first = await executor.execute(tool, {"path": "README.md"}, context)
+    assert first.success is True
+    assert tool.count == 1
+
+    interrupted_runs, invalidated_approvals = (
+        await _interrupt_unfinished_with_optional_durable(repository, durable)
+    )
+    assert interrupted_runs == 1
+    assert invalidated_approvals == 0
+    assert (await repository.get_run(run.session_id)).status is RunStatus.INTERRUPTED
+    assert (await durable.get_run(run.session_id)).status is DurableRunStatus.CANCELLED
+
+    second = await executor.execute(tool, {"path": "README.md"}, context)
+    assert second.success is True
+    assert second.content == first.content
+    assert tool.count == 1
 
 
 @pytest.mark.asyncio

@@ -40,4 +40,30 @@ describe("ChatComposer", () => {
     expect(textarea.style.height).toBe("");
     expect(textarea.style.overflowY).toBe("");
   });
+
+  it("keeps Stop enabled while Send is disabled for an active run", async () => {
+    const user = userEvent.setup();
+    const onStop = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ChatComposer
+        disabled
+        disabledReason="Waiting for approval decision."
+        stopEnabled
+        onStop={onStop}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+    const stop = screen.getByRole("button", { name: "Stop" });
+    expect(stop).toHaveTextContent("Stop");
+    expect(stop).toBeEnabled();
+    await user.click(stop);
+    await waitFor(() => expect(onStop).toHaveBeenCalledTimes(1));
+  });
+
+  it("does not render Stop when the run is idle", () => {
+    render(<ChatComposer disabled={false} onSubmit={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument();
+  });
 });

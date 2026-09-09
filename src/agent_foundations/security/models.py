@@ -26,11 +26,19 @@ PHASE2C_READONLY_TOOLS: tuple[str, ...] = (
     "update_plan_step",
     "replan",
     "validate_patch",
+    "git_status",
+    "git_diff",
+    "git_log",
 )
 
 PHASE2C_KNOWN_WRITE_TOOLS: tuple[str, ...] = ("apply_patch",)
 
 PHASE2C_KNOWN_PROCESS_TOOLS: tuple[str, ...] = ("run_command",)
+
+PHASE2C_KNOWN_OUTPUT_TOOLS: tuple[str, ...] = (
+    "read_command_output",
+    "search_command_output",
+)
 
 
 def default_allowed_tools(profile_name: PermissionProfileName) -> tuple[str, ...]:
@@ -45,6 +53,7 @@ def default_allowed_tools(profile_name: PermissionProfileName) -> tuple[str, ...
             PHASE2C_READONLY_TOOLS
             + PHASE2C_KNOWN_WRITE_TOOLS
             + PHASE2C_KNOWN_PROCESS_TOOLS
+            + PHASE2C_KNOWN_OUTPUT_TOOLS
         )
     return PHASE2C_READONLY_TOOLS
 

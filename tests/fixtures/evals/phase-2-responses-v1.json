@@ -1,0 +1,143 @@
+{
+  "schema_version": 1,
+  "fixture_id": "phase-2-responses",
+  "fixture_version": "v1",
+  "scripts": [
+    {
+      "task_id": "phase2-plan-and-read",
+      "responses": [
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-set-plan-p2",
+              "name": "set_plan",
+              "arguments": {
+                "goal": "Inspect the failing test",
+                "steps": [
+                  {
+                    "step_id": "read-failing-test",
+                    "description": "Read tests/test_fail.py"
+                  }
+                ]
+              }
+            }
+          ],
+          "usage": {"input_tokens": 8, "output_tokens": 6}
+        },
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-upd-inprog-p2",
+              "name": "update_plan_step",
+              "arguments": {
+                "plan_version": 1,
+                "step_id": "read-failing-test",
+                "status": "in_progress"
+              }
+            }
+          ],
+          "usage": {"input_tokens": 6, "output_tokens": 4}
+        },
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-read-fail-p2",
+              "name": "read_file",
+              "arguments": {"path": "tests/test_fail.py"}
+            }
+          ],
+          "usage": {"input_tokens": 6, "output_tokens": 4}
+        },
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-upd-done-p2",
+              "name": "update_plan_step",
+              "arguments": {
+                "plan_version": 2,
+                "step_id": "read-failing-test",
+                "status": "completed",
+                "evidence_tool_call_ids": ["call-read-fail-p2"]
+              }
+            }
+          ],
+          "usage": {"input_tokens": 6, "output_tokens": 4}
+        },
+        {
+          "content": "The failing test uses assert False in tests/test_fail.py.",
+          "tool_calls": [],
+          "usage": {"input_tokens": 10, "output_tokens": 8}
+        }
+      ]
+    },
+    {
+      "task_id": "phase2-git-status",
+      "responses": [
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-git-status-p2",
+              "name": "git_status",
+              "arguments": {}
+            }
+          ],
+          "usage": {"input_tokens": 4, "output_tokens": 3}
+        },
+        {
+          "content": "git_status reports tests/test_fail.py is modified.",
+          "tool_calls": [],
+          "usage": {"input_tokens": 8, "output_tokens": 6}
+        }
+      ]
+    },
+    {
+      "task_id": "phase2-sensitive-file-rejection",
+      "responses": [
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-read-env-p2",
+              "name": "read_file",
+              "arguments": {"path": ".env"}
+            }
+          ],
+          "usage": {"input_tokens": 4, "output_tokens": 3}
+        },
+        {
+          "content": "Reading .env is blocked by project path policy.",
+          "tool_calls": [],
+          "usage": {"input_tokens": 6, "output_tokens": 4}
+        }
+      ]
+    },
+    {
+      "task_id": "phase2-apply-patch-requires-control",
+      "responses": [
+        {
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call-apply-p2",
+              "name": "apply_patch",
+              "arguments": {
+                "patch_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              }
+            }
+          ],
+          "usage": {"input_tokens": 4, "output_tokens": 3}
+        },
+        {
+          "content": "apply_patch requires controlled sandbox execution and must not call Docker from Offline Eval.",
+          "tool_calls": [],
+          "usage": {"input_tokens": 6, "output_tokens": 4}
+        }
+      ]
+    }
+  ]
+}

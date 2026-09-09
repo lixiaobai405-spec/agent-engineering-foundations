@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,7 @@ from agent_foundations.runtime.agent import AgentConfig
 from agent_foundations.runtime.loop import AgentLoop
 from agent_foundations.runtime.redaction import Redactor
 from agent_foundations.runtime.tool_execution import ToolCallExecutor
-from agent_foundations.runtime.trace import EventSink
+from agent_foundations.runtime.trace import EventSink, NoOpEventSink
 from tests.unit.tools.registry_helpers import readonly_tool_registry
 
 CONVERSATION_ID = "11111111-1111-4111-8111-111111111111"
@@ -161,7 +162,14 @@ async def test_runner_completes_turn_with_history_and_fixed_session(
     assert assistant.content == "continued answer"
     assert assistant.sequence == user_message.sequence + 1
 
-    assert [message.content for message in provider.requests[0].messages] == [
+    contents = [message.content for message in provider.requests[0].messages]
+    assert contents[0] == AgentConfig().system_prompt
+    visible = [
+        content
+        for content in contents
+        if not (isinstance(content, str) and content.startswith("[repository context]"))
+    ]
+    assert visible == [
         AgentConfig().system_prompt,
         "old question",
         "old answer",
@@ -170,6 +178,10 @@ async def test_runner_completes_turn_with_history_and_fixed_session(
     assert provider.requests[0].messages[0].role is Role.SYSTEM
     assert all(
         message.role in {Role.USER, Role.ASSISTANT}
+        or (
+            message.role is Role.SYSTEM
+            and (message.content or "").startswith("[repository context]")
+        )
         for message in provider.requests[0].messages[1:]
     )
 
@@ -723,3 +735,326 @@ async def test_runner_list_context_before_failure_marks_failed_safely(
     assert "RuntimeError" in serialized
     assert "do-not-leak-context-secret" not in serialized
     assert "Traceback" not in serialized
+
+
+def _model_request_id(session_id: str) -> str:
+    from uuid import UUID, uuid5
+
+    from agent_foundations.runtime.state_machine import AgentRunPhase
+
+    return str(
+        uuid5(UUID(session_id), f"model:1:{AgentRunPhase.READY_FOR_MODEL.value}"),
+    )
+
+
+async def _open_durable(repository: ConversationRepository) -> Any:
+    from agent_foundations.durable.repository import DurableRunRepository
+
+    durable = DurableRunRepository(repository._database_path)
+    await durable.initialize()
+    return durable
+
+
+def _resilient_runtime_factory(inner: Any, *, max_attempts: int) -> Any:
+    from agent_foundations.providers.resilient import ResilientModelProvider, RetryPolicy
+    from agent_foundations.runtime.provider_attempt_budget import ProviderAttemptBudget
+    from agent_foundations.runtime.rate_limit import (
+        FakeClock,
+        FakeSleeper,
+        TokenBucketRateLimiter,
+    )
+
+    clock = FakeClock()
+    sleeper = FakeSleeper(clock)
+    provider = ResilientModelProvider(
+        inner,
+        policy=RetryPolicy(max_attempts=max_attempts),
+        budget=ProviderAttemptBudget(max_attempts=max_attempts),
+        limiter=TokenBucketRateLimiter(
+            capacity=8,
+            refill_per_second=8.0,
+            clock=clock,
+            sleeper=sleeper,
+        ),
+        clock=clock,
+        sleeper=sleeper,
+    )
+
+    def factory(
+        conversation: Conversation,
+        event_sink: EventSink,
+        tool_executor: ToolCallExecutor,
+    ) -> AgentLoop:
+        return AgentLoop(
+            provider=provider,
+            registry=readonly_tool_registry(Path(conversation.project_root)),
+            context_builder=ContextBuilder(ContextBudget()),
+            event_sink=event_sink,
+            config=AgentConfig(max_steps=5),
+            tool_executor=tool_executor,
+        )
+
+    return factory
+
+
+@pytest.mark.asyncio
+async def test_chat_crash_after_reserve_new_runner_does_not_recall_inner(
+    tmp_path: Path,
+) -> None:
+    from agent_foundations.domain.errors import ProviderTimeoutError
+    from agent_foundations.durable.repository import CheckpointNotFoundError
+    from agent_foundations.runtime.provider_attempt_budget import (
+        ProviderAttemptExhaustedError,
+    )
+
+    ConversationRunner, direct_executor_factory = _require_runner_types()
+    repository, conversation, project_root = await _prepare_conversation(tmp_path)
+    durable = await _open_durable(repository)
+    user_message, _ = await repository.begin_run(
+        conversation.conversation_id,
+        content="crash after reserve",
+        session_id=SESSION_ID,
+    )
+
+    class CrashAfterReserveInner:
+        calls = 0
+
+        async def complete(self, request: Any) -> ModelResponse:
+            type(self).calls += 1
+            raise ProviderTimeoutError("simulated crash after reserve")
+
+    class ForbiddenInner:
+        calls = 0
+
+        async def complete(self, request: Any) -> ModelResponse:
+            type(self).calls += 1
+            return ModelResponse(content="should-not-run")
+
+    first_inner = CrashAfterReserveInner()
+    runner = ConversationRunner(
+        repository=repository,
+        broker=RecordingBroker(repository, SESSION_ID),
+        runtime_factory=_resilient_runtime_factory(first_inner, max_attempts=1),
+        trace_dir=tmp_path / "traces",
+        redactor_factory=lambda item: Redactor(Path(item.project_root)),
+        tool_executor_factory=direct_executor_factory,
+        durable_repository=durable,
+    )
+    await runner.run_turn(
+        conversation.conversation_id,
+        SESSION_ID,
+        user_message.message_id,
+        "crash after reserve",
+    )
+    assert first_inner.calls == 1
+
+    restarted = await _open_durable(repository)
+    try:
+        checkpoint = await restarted.load_latest_checkpoint(SESSION_ID)
+        attempts = dict(checkpoint.state.provider_attempts)
+    except CheckpointNotFoundError:
+        attempts = {}
+
+    second_inner = ForbiddenInner()
+    runner2 = ConversationRunner(
+        repository=repository,
+        broker=RecordingBroker(repository, SESSION_ID),
+        runtime_factory=_resilient_runtime_factory(second_inner, max_attempts=1),
+        trace_dir=tmp_path / "traces-restart",
+        redactor_factory=lambda item: Redactor(Path(item.project_root)),
+        tool_executor_factory=direct_executor_factory,
+        durable_repository=restarted,
+    )
+    loop = runner2._runtime_factory(
+        conversation,
+        NoOpEventSink(),
+        direct_executor_factory(conversation, SESSION_ID),
+    )
+    run_kwargs: dict[str, Any] = {"session_id": SESSION_ID, "history": ()}
+    import inspect
+
+    parameters = inspect.signature(AgentLoop.run).parameters
+    if "provider_attempts" in parameters:
+        run_kwargs["provider_attempts"] = attempts
+    if "checkpoint_sink" in parameters:
+        run_kwargs["checkpoint_sink"] = None
+    try:
+        await loop.run(project_root, "crash after reserve", **run_kwargs)
+    except ProviderAttemptExhaustedError:
+        pass
+    assert second_inner.calls == 0
+    request_key = _model_request_id(SESSION_ID)
+    assert attempts.get(request_key) == 1
+    durable_run = await restarted.get_run(SESSION_ID)
+    assert durable_run.attempt == 1
+
+
+@pytest.mark.asyncio
+async def test_run_turn_forwards_checkpoint_sink_and_does_not_treat_interrupt_as_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_foundations.durable.repository import CheckpointNotFoundError
+
+    ConversationRunner, direct_executor_factory = _require_runner_types()
+    repository, conversation, _ = await _prepare_conversation(tmp_path)
+    durable = await _open_durable(repository)
+    user_message, _ = await repository.begin_run(
+        conversation.conversation_id,
+        content="cancel after reserve",
+        session_id=SESSION_ID,
+    )
+    started = asyncio.Event()
+
+    class HangAfterReserveInner:
+        async def complete(self, request: Any) -> ModelResponse:
+            started.set()
+            await asyncio.Event().wait()
+            return ModelResponse(content="unreachable")
+
+    seen: dict[str, Any] = {}
+    original_run = AgentLoop.run
+
+    async def tracking_run(
+        self: AgentLoop,
+        root: Path,
+        query: str,
+        **kwargs: Any,
+    ) -> Any:
+        seen.update(kwargs)
+        return await original_run(self, root, query, **kwargs)
+
+    monkeypatch.setattr(AgentLoop, "run", tracking_run)
+    runner = ConversationRunner(
+        repository=repository,
+        broker=RecordingBroker(repository, SESSION_ID),
+        runtime_factory=_resilient_runtime_factory(
+            HangAfterReserveInner(),
+            max_attempts=1,
+        ),
+        trace_dir=tmp_path / "traces",
+        redactor_factory=lambda item: Redactor(Path(item.project_root)),
+        tool_executor_factory=direct_executor_factory,
+        durable_repository=durable,
+    )
+    task = asyncio.create_task(
+        runner.run_turn(
+            conversation.conversation_id,
+            SESSION_ID,
+            user_message.message_id,
+            "cancel after reserve",
+        ),
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    interrupted = await repository.get_run(SESSION_ID)
+    assert interrupted.status is RunStatus.INTERRUPTED
+    assert seen.get("checkpoint_sink") is not None
+    assert seen.get("session_id") == SESSION_ID
+    try:
+        checkpoint = await durable.load_latest_checkpoint(SESSION_ID)
+        attempts = dict(checkpoint.state.provider_attempts)
+    except CheckpointNotFoundError:
+        attempts = {}
+    assert attempts.get(_model_request_id(SESSION_ID)) == 1
+    durable_run = await durable.get_run(SESSION_ID)
+    assert durable_run.attempt == 1
+    assert durable_run.status.value == "cancelled"
+
+
+def _durable_run(run_id: str, project_root: Path, status: Any) -> Any:
+    from agent_foundations.durable.models import DurableRun
+
+    now = datetime(2026, 9, 8, 12, 0, 0, tzinfo=UTC)
+    return DurableRun(
+        run_id=run_id,
+        project_root=str(project_root),
+        status=status,
+        schema_version=1,
+        state_version=0,
+        attempt=1,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+async def _running_chat_and_runner(
+    tmp_path: Path,
+    durable_status: Any | None,
+) -> tuple[Any, Any, Any]:
+    ConversationRunner, direct_executor_factory = _require_runner_types()
+    repository, conversation, project_root = await _prepare_conversation(tmp_path)
+    _, run = await repository.begin_run(
+        conversation.conversation_id,
+        content="interrupt durable",
+        session_id=SESSION_ID,
+    )
+    await repository.transition_run(
+        run.session_id,
+        RunStatus.QUEUED,
+        RunStatus.RUNNING,
+    )
+    durable = await _open_durable(repository)
+    if durable_status is not None:
+        await durable.create_run(
+            _durable_run(run.session_id, project_root, durable_status),
+        )
+    runner = ConversationRunner(
+        repository=repository,
+        broker=RecordingBroker(repository, SESSION_ID),
+        runtime_factory=_build_runtime_factory(
+            FakeModelProvider([ModelResponse(content="ok")]),
+        ),
+        trace_dir=tmp_path / "traces",
+        redactor_factory=lambda item: Redactor(Path(item.project_root)),
+        tool_executor_factory=direct_executor_factory,
+        durable_repository=durable,
+    )
+    return repository, durable, runner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "durable_status",
+    ["created", "running", "waiting_approval", "paused"],
+)
+async def test_safe_interrupt_run_cancels_cancelable_durable(
+    tmp_path: Path,
+    durable_status: str,
+) -> None:
+    from agent_foundations.durable.models import DurableRunStatus
+
+    status = DurableRunStatus(durable_status)
+    repository, durable, runner = await _running_chat_and_runner(tmp_path, status)
+    await runner._safe_interrupt_run(SESSION_ID)
+    assert (await repository.get_run(SESSION_ID)).status is RunStatus.INTERRUPTED
+    assert (await durable.get_run(SESSION_ID)).status is DurableRunStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("durable_status", ["completed", "failed", "cancelled"])
+async def test_safe_interrupt_run_skips_terminal_durable(
+    tmp_path: Path,
+    durable_status: str,
+) -> None:
+    from agent_foundations.durable.models import DurableRunStatus
+
+    expected = DurableRunStatus(durable_status)
+    repository, durable, runner = await _running_chat_and_runner(tmp_path, expected)
+    await runner._safe_interrupt_run(SESSION_ID)
+    assert (await repository.get_run(SESSION_ID)).status is RunStatus.INTERRUPTED
+    assert (await durable.get_run(SESSION_ID)).status is expected
+
+
+@pytest.mark.asyncio
+async def test_safe_interrupt_run_skips_missing_durable_row(tmp_path: Path) -> None:
+    from agent_foundations.durable.repository import DurableRunNotFoundError
+
+    repository, durable, runner = await _running_chat_and_runner(tmp_path, None)
+    await runner._safe_interrupt_run(SESSION_ID)
+    assert (await repository.get_run(SESSION_ID)).status is RunStatus.INTERRUPTED
+    with pytest.raises(DurableRunNotFoundError):
+        await durable.get_run(SESSION_ID)

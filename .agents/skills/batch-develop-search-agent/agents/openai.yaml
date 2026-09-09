@@ -1,0 +1,11 @@
+interface:
+  display_name: "Search Agent Batch Development"
+  short_description: "Run an authorized search_agent Task batch safely"
+  default_prompt: |
+    I authorize this invocation to execute the consecutive Task set with $batch-develop-search-agent:
+    project_root: D:\codex-pj\search_agent
+    required_branch: <required-existing-branch>
+    start_task_id: <required-existing-task-id>
+    authorized_task_count: <required-positive-integer>
+policy:
+  allow_implicit_invocation: false

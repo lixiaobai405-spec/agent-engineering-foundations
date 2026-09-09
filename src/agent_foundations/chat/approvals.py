@@ -11,6 +11,7 @@ from agent_foundations.chat.errors import (
 )
 from agent_foundations.chat.events import ChatEventBroker
 from agent_foundations.chat.models import (
+    AccessOperation,
     ApprovalDecision,
     ApprovalRequest,
     ApprovalStatus,
@@ -38,14 +39,105 @@ from agent_foundations.security.models import (
     PermissionProfileName,
     PolicyOutcome,
     PolicyRequest,
+    PolicyResource,
+    ResourceScope,
+)
+from agent_foundations.security.models import (
+    PolicyDecision as SecurityPolicyDecision,
 )
 from agent_foundations.security.repository import AuthorizationRepository
+
+
+def _bounded_identifier(value: str, fallback: str) -> str:
+    text = value.strip() or fallback
+    return text[:256]
+
+
+def approval_view_fields(
+    request: ApprovalRequest,
+    policy_request: PolicyRequest | None = None,
+    outcome: PolicyOutcome | None = None,
+) -> tuple[str, str, str, str]:
+    resolved_request, resolved_outcome = _policy_for_approval_view(
+        request,
+        policy_request,
+        outcome,
+    )
+    operation = resolved_request.operation
+    if operation not in {"read", "apply", "run"}:
+        operation = "read"
+    decision = resolved_outcome.decision.value
+    if decision not in {"allow", "ask", "deny"}:
+        decision = "ask"
+    return (
+        operation,
+        resolved_request.resource.kind,
+        resolved_request.resource.scope.value,
+        decision,
+    )
+
+
+def _policy_for_approval_view(
+    request: ApprovalRequest,
+    policy_request: PolicyRequest | None,
+    outcome: PolicyOutcome | None,
+) -> tuple[PolicyRequest, PolicyOutcome]:
+    if policy_request is not None:
+        return policy_request, outcome or _pending_ask_outcome()
+    from agent_foundations.tools.command.run_command import RUN_COMMAND_MANIFEST
+    from agent_foundations.tools.filesystem.read_file import READ_FILE_MANIFEST
+    from agent_foundations.tools.patch.apply_patch import APPLY_PATCH_MANIFEST
+
+    if request.tool_name == "run_command":
+        manifest = RUN_COMMAND_MANIFEST
+        operation = "run"
+        resource = PolicyResource(
+            kind="sandbox_command",
+            scope=ResourceScope.PROJECT_INTERNAL,
+            identifier=_bounded_identifier(request.canonical_path, "sandbox_command"),
+        )
+    elif request.tool_name == "apply_patch" or request.operation is AccessOperation.APPLY:
+        manifest = APPLY_PATCH_MANIFEST
+        operation = "apply"
+        resource = PolicyResource(
+            kind="project_path",
+            scope=ResourceScope.PROJECT_INTERNAL,
+            identifier=_bounded_identifier(request.canonical_path, "project_path"),
+        )
+    else:
+        manifest = READ_FILE_MANIFEST
+        operation = "read"
+        resource = PolicyResource(
+            kind="project_path",
+            scope=ResourceScope.EXTERNAL_EXACT_PATH,
+            identifier=_bounded_identifier(request.canonical_path, "project_path"),
+        )
+    derived = PolicyRequest(
+        profile_version=1,
+        run_id=request.session_id,
+        tool_call_id=request.tool_call_id,
+        tool_name=request.tool_name,
+        manifest=manifest,
+        resource=resource,
+        operation=operation,
+    )
+    return derived, _pending_ask_outcome()
+
+
+def _pending_ask_outcome() -> PolicyOutcome:
+    return PolicyOutcome(
+        decision=SecurityPolicyDecision.ASK,
+        rule_id="chat.pending_approval",
+        reason_code="approval_required",
+    )
 
 
 @dataclass
 class _WaiterState:
     future: asyncio.Future[ApprovalStatus]
     request: ApprovalRequest
+    policy_request: PolicyRequest | None = None
+    outcome: PolicyOutcome | None = None
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     finished: asyncio.Event = field(default_factory=asyncio.Event)
@@ -99,7 +191,7 @@ class ApprovalCoordinator:
         legacy_status = await self._resolved_legacy_status(request)
         if legacy_status is None:
             try:
-                legacy_status = await self.request(request)
+                legacy_status = await self.request(request, policy_request, outcome)
             except BaseException:
                 await self._authorization_repository.invalidate_pending(
                     pending.authorization_id,
@@ -153,13 +245,23 @@ class ApprovalCoordinator:
     ) -> Capability:
         return await self._capability_consumer.consume(capability_id, execution)
 
-    async def request(self, request: ApprovalRequest) -> ApprovalStatus:
+    async def request(
+        self,
+        request: ApprovalRequest,
+        policy_request: PolicyRequest | None = None,
+        outcome: PolicyOutcome | None = None,
+    ) -> ApprovalStatus:
         if request.status is not ApprovalStatus.PENDING:
             raise ChatConflictError("approval request must be pending")
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[ApprovalStatus] = loop.create_future()
-        state = _WaiterState(future=future, request=request)
+        state = _WaiterState(
+            future=future,
+            request=request,
+            policy_request=policy_request,
+            outcome=outcome,
+        )
         try:
             async with state.lifecycle_lock:
                 async with self._lock:
@@ -189,7 +291,13 @@ class ApprovalCoordinator:
                     await self._restore_run_to_running(request.session_id)
                     raise
                 try:
-                    await self._broker.publish(self._build_requested_event(request))
+                    await self._broker.publish(
+                        self._build_requested_event(
+                            request,
+                            policy_request,
+                            outcome,
+                        )
+                    )
                 except Exception:
                     await self._repository.invalidate_approval(request.approval_id)
                     await self._restore_run_to_running(request.session_id)
@@ -317,7 +425,17 @@ class ApprovalCoordinator:
             )
         raise ChatConflictError("approval is not pending")
 
-    def _build_requested_event(self, request: ApprovalRequest) -> ChatEvent:
+    def _build_requested_event(
+        self,
+        request: ApprovalRequest,
+        policy_request: PolicyRequest | None = None,
+        outcome: PolicyOutcome | None = None,
+    ) -> ChatEvent:
+        operation, resource_kind, scope, policy_decision = approval_view_fields(
+            request,
+            policy_request,
+            outcome,
+        )
         return ChatEvent(
             conversation_id=request.conversation_id,
             session_id=request.session_id,
@@ -328,8 +446,10 @@ class ApprovalCoordinator:
                 "tool_call_id": request.tool_call_id,
                 "tool_name": request.tool_name,
                 "canonical_path": request.canonical_path,
-                "operation": request.operation.value,
-                "scope": "external_exact_path",
+                "operation": operation,
+                "resource_kind": resource_kind,
+                "scope": scope,
+                "policy_decision": policy_decision,
             },
         )
 

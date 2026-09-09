@@ -1,0 +1,3 @@
+✓ built in 12ms
+[plugin builtin:vite-reporter]
+(!) Some chunks are larger than 500 kB after minification.

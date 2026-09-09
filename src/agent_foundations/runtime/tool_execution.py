@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
@@ -41,7 +44,76 @@ class DirectToolCallExecutor:
         arguments: dict[str, Any],
         context: ToolExecutionContext,
     ) -> ToolResult:
+        if tool.name in {"apply_patch", "run_command"}:
+            return ToolResult(
+                success=False,
+                content=f"{tool.name} requires controlled sandbox execution",
+                error_code="CONTROLLED_EXECUTION_REQUIRED",
+            )
         return await tool.execute(arguments)
+
+
+async def mark_effect_rolled_back(
+    ledger: SideEffectLedger,
+    record: SideEffectRecord,
+    execution_owner_id: str,
+    result: ToolResult,
+) -> SideEffectRecord:
+    """Persist a verified rollback terminal state until the durable API owns it."""
+    repository = ledger._repository
+    checked_at = ledger._clock().astimezone(UTC)
+
+    def transition() -> None:
+        with repository._database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT status, execution_owner_id FROM side_effects WHERE effect_id = ?",
+                    (record.effect_id,),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("side effect not found")
+                if row["status"] != EffectStatus.EXECUTING.value:
+                    raise RuntimeError("side effect is not executing")
+                if row["execution_owner_id"] != execution_owner_id:
+                    raise RuntimeError("side effect execution owner mismatch")
+                serialized_result = json.dumps(
+                    result.model_dump(mode="json"),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+                timestamp = checked_at.isoformat()
+                cursor = connection.execute(
+                    """
+                    UPDATE side_effects
+                    SET status = ?, result_json = ?, error_code = ?, updated_at = ?,
+                        resolved_at = ?
+                    WHERE effect_id = ? AND status = ? AND execution_owner_id = ?
+                    """,
+                    (
+                        EffectStatus.ROLLED_BACK.value,
+                        serialized_result,
+                        result.error_code,
+                        timestamp,
+                        timestamp,
+                        record.effect_id,
+                        EffectStatus.EXECUTING.value,
+                        execution_owner_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("side effect rollback transition conflicted")
+                connection.commit()
+            except (RuntimeError, sqlite3.Error):
+                connection.rollback()
+                raise
+
+    await asyncio.to_thread(transition)
+    updated = await ledger.get(record.run_id, record.tool_call_id, record.tool_name)
+    if updated is None:
+        raise RuntimeError("rolled back side effect disappeared")
+    return updated
 
 
 @runtime_checkable

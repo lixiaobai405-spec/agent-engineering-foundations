@@ -1,0 +1,1 @@
+src/a.py:1: error: invalid syntax

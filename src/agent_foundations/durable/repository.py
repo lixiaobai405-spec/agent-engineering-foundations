@@ -5,7 +5,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 
@@ -19,6 +19,10 @@ from agent_foundations.durable.models import (
     RunState,
     SideEffectIntent,
     SideEffectRecord,
+)
+from agent_foundations.runtime.provider_attempt_budget import (
+    AttemptReservation,
+    ProviderAttemptExhaustedError,
 )
 from agent_foundations.storage.database import SqliteDatabase
 from agent_foundations.storage.migrations import get_application_migrations
@@ -355,6 +359,19 @@ class DurableRunRepository:
             expected_status,
         )
 
+    async def reserve_provider_attempt(
+        self,
+        run_id: str,
+        request_id: UUID,
+        max_attempts: int,
+    ) -> AttemptReservation:
+        return await asyncio.to_thread(
+            self._reserve_provider_attempt_sync,
+            run_id,
+            request_id,
+            max_attempts,
+        )
+
     async def begin_retry(
         self,
         run_id: str,
@@ -659,6 +676,126 @@ class DurableRunRepository:
             created_at=now,
         )
 
+    def _reserve_provider_attempt_sync(
+        self,
+        run_id: str,
+        request_id: UUID,
+        max_attempts: int,
+    ) -> AttemptReservation:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        checkpoint_id = str(uuid4())
+        now = datetime.now(UTC)
+        request_key = str(request_id)
+        reservation: AttemptReservation | None = None
+
+        with self._database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                run_row = connection.execute(
+                    """
+                    SELECT state_version, attempt
+                    FROM durable_runs
+                    WHERE run_id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+                if run_row is None:
+                    connection.rollback()
+                    raise DurableRunNotFoundError(f"durable run not found: {run_id}")
+
+                latest = connection.execute(
+                    """
+                    SELECT state_json
+                    FROM run_checkpoints
+                    WHERE run_id = ?
+                    ORDER BY sequence DESC
+                    LIMIT 1
+                    """,
+                    (run_id,),
+                ).fetchone()
+                if latest is None:
+                    connection.rollback()
+                    raise CheckpointNotFoundError(
+                        f"no checkpoint found for run: {run_id}",
+                    )
+                state = RunState.model_validate_json(latest["state_json"])
+                _validate_run_state_for_run(run_id, state)
+                consumed = int(state.provider_attempts.get(request_key, 0))
+                if consumed >= max_attempts:
+                    connection.rollback()
+                    raise ProviderAttemptExhaustedError(
+                        f"provider attempt budget exhausted for request {request_id}",
+                    )
+                consumed += 1
+                attempts = dict(state.provider_attempts)
+                attempts[request_key] = consumed
+                next_state = state.model_copy(update={"provider_attempts": attempts})
+                state_json = _serialize_run_state(next_state)
+
+                next_sequence_row = connection.execute(
+                    """
+                    SELECT COALESCE(MAX(sequence), 0) + 1
+                    FROM run_checkpoints
+                    WHERE run_id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+                sequence = int(next_sequence_row[0])
+                connection.execute(
+                    """
+                    INSERT INTO run_checkpoints (
+                        checkpoint_id,
+                        run_id,
+                        sequence,
+                        schema_version,
+                        state_json,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        checkpoint_id,
+                        run_id,
+                        sequence,
+                        _CHECKPOINT_SCHEMA_VERSION,
+                        state_json,
+                        _serialize_datetime(now),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE durable_runs
+                    SET state_version = state_version + 1,
+                        updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (_serialize_datetime(now), run_id),
+                )
+                connection.commit()
+                reservation = AttemptReservation(
+                    run_id=UUID(run_id),
+                    request_id=request_id,
+                    attempt_index=consumed,
+                    remaining=max_attempts - consumed,
+                )
+            except sqlite3.Error:
+                connection.rollback()
+                raise
+            except DurableRepositoryError:
+                connection.rollback()
+                raise
+            except ProviderAttemptExhaustedError:
+                raise
+            except Exception:
+                connection.rollback()
+                raise
+
+        if reservation is None:
+            raise ProviderAttemptExhaustedError(
+                f"provider attempt budget exhausted for request {request_id}",
+            )
+        return reservation
+
     def _begin_retry_sync(
         self,
         run_id: str,
@@ -696,7 +833,10 @@ class DurableRunRepository:
                     )
                 current_attempt = int(row["attempt"])
                 retry_state = state.model_copy(
-                    update={"attempt": current_attempt + 1},
+                    update={
+                        "attempt": current_attempt + 1,
+                        "provider_attempts": {},
+                    },
                 )
                 state_json = _serialize_run_state(retry_state)
 

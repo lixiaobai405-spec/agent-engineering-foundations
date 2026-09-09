@@ -70,3 +70,16 @@ class RunSupervisor:
         if task.cancelled():
             return
         task.exception()
+
+    async def cancel(self, conversation_id: str) -> None:
+        async with self._lock:
+            if self._closed:
+                return
+            task = self._tasks.get(conversation_id)
+            if task is None or task.done():
+                return
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            return

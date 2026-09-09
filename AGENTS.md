@@ -15,46 +15,44 @@
 - 必须保留可重复测试和可审查的实现过程。
 - 不为了“尽快跑起来”跳过协议、测试、安全边界或学习笔记。
 
-## 2. 当前权威文档
+## 2. 权威文档
 
-执行前按以下顺序阅读：
+本文件只保留长期有效的目标、安全禁区、角色和执行流程。**不要**在本文件里维护「当前做到第几个 Task」「有没有已授权 prompt」这类快照；那些句子必然过时，且会被自动注入会话。
 
-1. `docs/agent-plans/2026-07-20-agent-engineering-learning-design.md`
-2. `docs/agent-plans/2026-08-08-phase-2-controllable-coding-agent-design.md`
-3. `docs/agent-plans/2026-08-08-phase-2-controllable-coding-agent-plan.md`
-4. `docs/agent-plans/2026-07-21-phase-1-implementation-plan.md`
-5. `docs/agent-plans/2026-08-02-phase-1d-interactive-chat-ui-design.md`
-6. `docs/agent-plans/2026-08-02-phase-1d-interactive-chat-ui-plan.md`
-7. 当前由 planner 单独生成且经用户确认的 Task 执行 prompt
+当前进度、勾选和验收入口：
 
-第一阶段计划：
+- Phase 2：`docs/agent-plans/2026-08-08-phase-2-controllable-coding-agent-plan.md` 的 §0 与各 Task 勾选
+- Phase 2 可靠性补强：`docs/agent-plans/2026-08-29-phase-2-reliability-follow-on-plan.md`
+- 单 Task 合同：用户确认的那一条 executor prompt，及其指向的计划章节与 `docs/task-evidence/`
 
-- Phase 1A：`docs/agent-plans/2026-07-21-phase-1a-foundations-plan.md`
-- Phase 1B：`docs/agent-plans/2026-07-21-phase-1b-readonly-agent-plan.md`
-- Phase 1C：`docs/agent-plans/2026-07-21-phase-1c-trace-viewer-plan.md`
-- Phase 1D：`docs/agent-plans/2026-08-02-phase-1d-interactive-chat-ui-plan.md`
+设计与计划目录（按需查阅，不必每次通读）：
 
-第二阶段设计：
-
-- Phase 2：`docs/agent-plans/2026-08-08-phase-2-controllable-coding-agent-design.md`
+- 学习设计：`docs/agent-plans/2026-07-20-agent-engineering-learning-design.md`
+- Phase 2 设计：`docs/agent-plans/2026-08-08-phase-2-controllable-coding-agent-design.md`
 - Phase 2 实施：`docs/agent-plans/2026-08-08-phase-2-controllable-coding-agent-plan.md`
-- Phase 2 详细实施计划已生成，但尚无经用户确认的单 Task 执行 prompt；不得自行开始实现。
+- Phase 1 实施：`docs/agent-plans/2026-07-21-phase-1-implementation-plan.md`
+- Phase 1D：`docs/agent-plans/2026-08-02-phase-1d-interactive-chat-ui-design.md`、`docs/agent-plans/2026-08-02-phase-1d-interactive-chat-ui-plan.md`
 
 优先级：
 
-1. 用户当前明确指令
-2. 本文件
-3. 已确认的设计文档
-4. 当前里程碑计划
+1. 用户当前明确指令（含已确认的单 Task prompt）
+2. 本文件的流程与安全禁区
+3. 已确认里程碑计划中的当前 Task 合同与 §0 进度
+4. 已确认的设计文档
 5. 代码注释和一般性建议
 
-如果计划中的命令或代码与本文件冲突，以本文件为准，并向用户报告冲突。
+冲突怎么处理：
 
-## 3. 当前阶段边界
+- 计划或 prompt 若放宽本文件中的安全、Git、TDD、conda、敏感信息或阶段禁区，以本文件为准，并向用户报告。
+- 本文件若仍残留进度快照，与已确认计划 §0 或当前 Task prompt 不一致，以计划 §0 与该 prompt 为准，向用户报告本文件需要更新，不得用过时快照否决已确认 Task。
+
+## 3. 阶段边界
 
 Phase 1A 已于 2026-07-25 通过用户验收，Phase 1B 与 Phase 1C 已于 2026-08-01 通过用户验收，Phase 1D 与第一阶段总体验收已于 2026-08-08 由用户确认通过。
 
-当前阶段为 Phase 2“可控 Coding Agent”的实施准备阶段。Phase 2 详细实施计划已生成，但没有已授权的实现 Task；用户将另行让 planner 为单个 Task 生成执行 prompt。在 prompt 获得用户确认前，不得修改生产代码或自行选择 Phase 2A 的第一个 Task。未来每次会话仍只能执行用户当前明确指定的一个 Task，真实进度以已确认实施计划、Task evidence、独立验收和用户确认共同为准。
+工作仍在 Phase 2「可控 Coding Agent」的能力与权限模型内，直到用户确认进入后续阶段。Phase 2 是否完成、Step 10/11 是否通过、下一步是哪一个 Task，只以已确认计划的勾选、evidence 和用户确认为准，不以本段为准。
+
+未获用户确认的 Task prompt 不得实施生产代码；一次只执行用户当前明确指定的一个 Task；不得自行选择「下一个看起来该做的 Task」。
 
 Phase 2 按顺序分为四个权限递增的子里程碑：
 
@@ -99,14 +97,14 @@ Phase 2 的 `PROJECT_FULL_ACCESS` 只表示项目范围内已实现能力可按�
 
 缺失的历史 Red 必须标记为 `unavailable`，不得凭记忆补写，也不得在实现完成后临时破坏代码并冒充原始 Red。reviewer 必须分别报告当前实现和 TDD 过程证据；新鲜复验只能证明当前行为，不能独立证明历史 Red→Green 顺序。既有 Task 不要求追溯生成虚假的 evidence。
 
-交给 Claude、DeepSeek 或其他模型执行 Phase 2 时，建议使用：
+交给 Claude、DeepSeek 或其他模型执行已确认 Task 时，建议使用（按当前 Task 替换计划路径与 Task ID，不要在此模板里写进度快照）：
 
 ```text
-你是 executor。先完整阅读项目根目录 AGENTS.md、Phase 2 权威设计、已确认的 Phase 2 实施计划和当前 Task。
-如果 Phase 2 实施计划或用户明确指定的 Task 不存在，保持等待，不修改任何文件。
-严格按当前子里程碑的 Task 顺序执行，一次只处理用户当前明确指定的一个 Task，不扩大 Tool 或权限范围。
+你是 executor。遵守仓库 AGENTS.md 的流程与安全规则。
+只执行我在本条消息中确认的一个 Task；合同以该 Task 所属已确认计划章节为准。
+未在本条确认的范围不要实现。不要用常驻文档里的历史阶段描述否决本 Task。
 每个 Task 都要先展示失败测试证据，再实现最小代码，然后运行指定验证。
-未经我明确授权，不要安装依赖、调用真实模型、commit、push、创建 PR，也不要进入下一子里程碑或实现 Phase 2 非目标。
+未经我明确授权，不要安装依赖、调用真实模型、commit、push、创建 PR，也不要扩大 Tool/权限或进入未确认的下一阶段。
 ```
 
 ## 5. 标准执行流程

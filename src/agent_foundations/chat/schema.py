@@ -103,3 +103,39 @@ CHAT_MIGRATIONS = (
     Migration(version=1, statements=SCHEMA_V1_STATEMENTS),
     Migration(version=2, statements=MIGRATION_V1_TO_V2_STATEMENTS),
 )
+
+PERMISSION_PROFILE_MIGRATION = Migration(
+    version=8,
+    statements=(
+        """
+        ALTER TABLE conversations ADD COLUMN permission_profile TEXT NOT NULL
+        DEFAULT 'PROJECT_READ_ONLY'
+        """,
+        """
+        ALTER TABLE conversations ADD COLUMN profile_version INTEGER NOT NULL
+        DEFAULT 1 CHECK(profile_version >= 1)
+        """,
+        """
+        UPDATE conversations SET permission_profile = CASE permission_mode
+          WHEN 'ASK_FOR_ACCESS' THEN 'ASK_ALWAYS' ELSE 'PROJECT_READ_ONLY' END
+        """,
+        "ALTER TABLE approval_requests RENAME TO approval_requests_v7",
+        """
+        CREATE TABLE approval_requests (
+          approval_id TEXT PRIMARY KEY,
+          conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
+          session_id TEXT NOT NULL REFERENCES runs(session_id),
+          tool_call_id TEXT NOT NULL,
+          tool_name TEXT NOT NULL,
+          canonical_path TEXT NOT NULL,
+          operation TEXT NOT NULL CHECK(operation IN ('read','apply')),
+          status TEXT NOT NULL CHECK(status IN ('pending','approved','denied','invalidated')),
+          requested_at TEXT NOT NULL,
+          decided_at TEXT,
+          UNIQUE(session_id, tool_call_id)
+        )
+        """,
+        "INSERT INTO approval_requests SELECT * FROM approval_requests_v7",
+        "DROP TABLE approval_requests_v7",
+    ),
+)

@@ -7,6 +7,7 @@ import type {
   RunRecord,
 } from "../state/types";
 import { ApprovalCard } from "./ApprovalCard";
+import { CommandFeedbackCard } from "./CommandFeedbackCard";
 
 function isActiveStatus(status: RunRecord["status"]): boolean {
   return status === "queued" || status === "running" || status === "waiting_approval";
@@ -78,6 +79,11 @@ export function ToolActivityGroup({
                   {activity.result_summary ? <p>{activity.result_summary}</p> : null}
                   <time>{timing(activity)}</time>
                 </article>
+                <CommandFeedbackCard
+                  conversationId={run.conversation_id}
+                  sessionId={run.session_id}
+                  activity={activity}
+                />
                 {approval?.tool_call_id === activity.tool_call_id ? (
                   <ApprovalCard
                     approval={approval}

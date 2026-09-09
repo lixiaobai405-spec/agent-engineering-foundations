@@ -1,0 +1,11 @@
+============================= test session starts ==============================
+collected 0 items / 1 error
+
+==================================== ERRORS ====================================
+_____________________ ERROR collecting tests/test_b.py _____________________
+ImportError while importing test module '/workspace/tests/test_b.py'.
+ImportError: No module named missing
+=========================== short test summary info ============================
+ERROR tests/test_b.py
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+============================== 1 error in 0.04s ===============================

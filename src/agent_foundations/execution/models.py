@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Literal
+from typing import Literal, Protocol
 from uuid import UUID
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
@@ -10,7 +10,7 @@ from agent_foundations.domain._model import ValidatedCopyModel
 
 MAX_STDIN_BYTES = 1024 * 1024
 MAX_TIMEOUT_SECONDS = 600
-MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 _CONTROL_LIMIT = 32
 
 
@@ -25,6 +25,10 @@ def _has_control(value: str) -> bool:
     return any(ord(character) < _CONTROL_LIMIT or ord(character) == 127 for character in value)
 
 
+class ByteStreamSink(Protocol):
+    def feed(self, stream: Literal["stdout", "stderr"], chunk: bytes) -> bool: ...
+
+
 class ExecutionRequest(ValidatedCopyModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
@@ -33,10 +37,12 @@ class ExecutionRequest(ValidatedCopyModel):
     capability_id: str
     argv: tuple[str, ...]
     cwd: str
-    mount_mode: Literal["read_only", "project_write"]
+    mount_mode: Literal["read_only", "project_write", "snapshot"]
+    sandbox_profile: Literal["legacy_patch", "python", "node"] = "legacy_patch"
     stdin: bytes = Field(default=b"", max_length=MAX_STDIN_BYTES)
     timeout_seconds: int = Field(gt=0, le=MAX_TIMEOUT_SECONDS)
     max_output_bytes: int = Field(gt=0, le=MAX_OUTPUT_BYTES)
+    env: tuple[tuple[str, str], ...] = ()
 
     _execution_uuid = field_validator("execution_id")(_uuid_string)
     _run_uuid = field_validator("run_id")(_uuid_string)
@@ -70,6 +76,26 @@ class ExecutionRequest(ValidatedCopyModel):
         if not parts or any(part == ".." for part in parts):
             raise ValueError("cwd must remain within the workspace")
         return value
+
+    @field_validator("env")
+    @classmethod
+    def _valid_env(cls, value: tuple[tuple[str, str], ...]) -> tuple[tuple[str, str], ...]:
+        for key, item in value:
+            if not key or key != key.strip() or any(character.isspace() for character in key):
+                raise ValueError("env keys must be non-empty tokens without whitespace")
+            if "=" in key or _has_control(key):
+                raise ValueError("env keys must not contain '=' or control characters")
+            if _has_control(item) or "\n" in item or "\r" in item:
+                raise ValueError("env values must not contain control characters")
+        return value
+
+    @model_validator(mode="after")
+    def _consistent_sandbox_profile(self) -> ExecutionRequest:
+        if self.mount_mode == "snapshot" and self.sandbox_profile == "legacy_patch":
+            raise ValueError("snapshot execution requires a fixed python or node profile")
+        if self.mount_mode != "snapshot" and self.sandbox_profile != "legacy_patch":
+            raise ValueError("fixed command profiles require snapshot mount mode")
+        return self
 
 
 class ExecutionResult(ValidatedCopyModel):

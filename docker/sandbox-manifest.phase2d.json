@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "python": {
+    "profile": "python",
+    "image_tag": "agent-foundations-sandbox-python:phase2d",
+    "base_repo_digest": "python@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2",
+    "lockfile_sha256": "54a48d9fe970cea3b27a5488b123660a0b6c73cd68e8462bdac231737b85c531",
+    "final_image_id": "sha256:730aea0a2ba8ef2998bb0cc43b1f94641a9099f8a0d55b22a0605f384ad26e41",
+    "final_repo_digest": "agent-foundations-sandbox-python@sha256:730aea0a2ba8ef2998bb0cc43b1f94641a9099f8a0d55b22a0605f384ad26e41"
+  },
+  "node": {
+    "profile": "node",
+    "image_tag": "agent-foundations-sandbox-node:phase2d",
+    "base_repo_digest": "node@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5",
+    "lockfile_sha256": "06c84831ab91e26c98c7ce32291c0e3aac95c97c0287203e5bb292687dbb8d98",
+    "final_image_id": "sha256:12f2470f314aae00f8757a313d78da471472984f7d039bdfdf1c57a553cfc0e7",
+    "final_repo_digest": "agent-foundations-sandbox-node@sha256:12f2470f314aae00f8757a313d78da471472984f7d039bdfdf1c57a553cfc0e7"
+  }
+}

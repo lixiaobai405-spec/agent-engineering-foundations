@@ -21,6 +21,7 @@ from agent_foundations.chat.models import (
 from agent_foundations.domain.errors import PathPolicyViolationError
 from agent_foundations.domain.tool import ToolResult
 from agent_foundations.runtime.tool_execution import ToolExecutionContext
+from agent_foundations.security.models import PermissionProfileName
 from agent_foundations.tools.filesystem.list_directory import ListDirectoryTool
 from agent_foundations.tools.filesystem.path_policy import PathPolicy
 from agent_foundations.tools.filesystem.read_file import ReadFileTool
@@ -45,6 +46,11 @@ def _conversation(root: Path, mode: PermissionMode) -> Conversation:
         title="Tool execution study",
         project_root=str(root),
         permission_mode=mode,
+        permission_profile=(
+            PermissionProfileName.ASK_ALWAYS
+            if mode is PermissionMode.ASK_FOR_ACCESS
+            else PermissionProfileName.PROJECT_READ_ONLY
+        ),
     )
 
 
@@ -67,7 +73,13 @@ class RecordingCoordinator:
         self.on_request = on_request
         self.requests: list[ApprovalRequest] = []
 
-    async def request(self, request: ApprovalRequest) -> ApprovalStatus:
+    async def request(
+        self,
+        request: ApprovalRequest,
+        policy_request: object | None = None,
+        outcome: object | None = None,
+    ) -> ApprovalStatus:
+        del policy_request, outcome
         self.requests.append(request)
         if self.on_request is not None:
             self.on_request()

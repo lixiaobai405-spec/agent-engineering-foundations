@@ -1,5 +1,6 @@
 from collections.abc import Mapping
 from typing import Annotated, Protocol, runtime_checkable
+from uuid import UUID
 
 from pydantic import (
     BaseModel,
@@ -32,6 +33,8 @@ class ModelRequest(BaseModel):
 
     messages: tuple[Message, ...]
     tools: tuple[ToolDefinition, ...] = ()
+    run_id: UUID | None = None
+    request_id: UUID | None = None
 
 
 class ModelResponse(ValidatedCopyModel):

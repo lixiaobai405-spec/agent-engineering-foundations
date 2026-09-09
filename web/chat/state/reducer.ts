@@ -5,6 +5,7 @@ import type {
   ChatMessage,
   ChatToolActivity,
   Conversation,
+  ConversationPlanState,
   ConversationStateResponse,
   PendingApprovalState,
   RunRecord,
@@ -23,6 +24,7 @@ export interface ChatState {
   activeSessionIdByConversation: Record<string, string | null>;
   latestSessionIdByConversation: Record<string, string | null>;
   activeApprovalByConversation: Record<string, ActiveApproval | null>;
+  planByConversation: Record<string, ConversationPlanState | null>;
   loadingConversations: boolean;
   conversationsError: string | null;
   loadingMessagesByConversation: Record<string, boolean>;
@@ -40,6 +42,7 @@ export const initialState: ChatState = {
   activeSessionIdByConversation: {},
   latestSessionIdByConversation: {},
   activeApprovalByConversation: {},
+  planByConversation: {},
   loadingConversations: false,
   conversationsError: null,
   loadingMessagesByConversation: {},
@@ -194,30 +197,47 @@ function assistantMessageFromEvent(event: ChatEvent): ChatMessage | null {
   };
 }
 
-function approvalFromEvent(event: ChatEvent): ActiveApproval | null {
-  const approvalId = event.data.approval_id;
-  const toolCallId = event.data.tool_call_id;
-  const toolName = event.data.tool_name;
-  const canonicalPath = event.data.canonical_path;
-  const operation = event.data.operation;
-  const scope = event.data.scope;
+function parseConversationPlan(value: unknown): ConversationPlanState | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
   if (
-    !isNonEmptyString(approvalId) ||
-    !isNonEmptyString(toolCallId) ||
-    !isNonEmptyString(toolName) ||
-    !isNonEmptyString(canonicalPath) ||
-    operation !== "read" ||
-    scope !== "external_exact_path"
+    !isNonEmptyString(record.plan_id) ||
+    typeof record.version !== "number" ||
+    !isNonEmptyString(record.goal) ||
+    typeof record.replan_count !== "number" ||
+    typeof record.max_replans !== "number" ||
+    !Array.isArray(record.steps)
   ) {
     return null;
   }
+  const steps: ConversationPlanState["steps"] = [];
+  for (const step of record.steps) {
+    if (typeof step !== "object" || step === null || Array.isArray(step)) {
+      return null;
+    }
+    const item = step as Record<string, unknown>;
+    if (
+      !isNonEmptyString(item.step_id) ||
+      !isNonEmptyString(item.status) ||
+      !isNonEmptyString(item.description)
+    ) {
+      return null;
+    }
+    steps.push({
+      step_id: item.step_id,
+      status: item.status,
+      description: item.description,
+    });
+  }
   return {
-    approval_id: approvalId,
-    tool_call_id: toolCallId,
-    tool_name: toolName,
-    canonical_path: canonicalPath,
-    operation: "read",
-    scope: "external_exact_path",
+    plan_id: record.plan_id,
+    version: record.version,
+    goal: record.goal,
+    replan_count: record.replan_count,
+    max_replans: record.max_replans,
+    steps,
   };
 }
 
@@ -231,15 +251,26 @@ function isActiveRunStatus(status: RunStatus): boolean {
 
 function activeApprovalFromPending(
   pending: PendingApprovalState,
+  patchPreview: ConversationStateResponse["patch_preview"],
 ): ActiveApproval {
-  return {
+  const approval: ActiveApproval = {
     approval_id: pending.approval_id,
     tool_call_id: pending.tool_call_id,
     tool_name: pending.tool_name,
     canonical_path: pending.canonical_path,
-    operation: "read",
-    scope: "external_exact_path",
+    operation: pending.operation,
+    scope: pending.scope,
+    policy_decision: pending.policy_decision,
+    resource_kind: pending.resource_kind,
   };
+  if (pending.operation === "apply") {
+    approval.one_time = true;
+    approval.backend = "docker";
+    if (patchPreview) {
+      approval.patch = patchPreview;
+    }
+  }
+  return approval;
 }
 
 function applyRecoveredRunState(
@@ -247,11 +278,13 @@ function applyRecoveredRunState(
   conversationId: string,
   run: RunRecord | null,
   pendingApproval: PendingApprovalState | null,
+  patchPreview: ConversationStateResponse["patch_preview"] = null,
+  plan: ConversationPlanState | null | undefined = undefined,
 ): ChatState {
   if (run === null) {
     const nextRunStatus = { ...state.runStatusByConversation };
     delete nextRunStatus[conversationId];
-    return {
+    const nextState: ChatState = {
       ...state,
       runStatusByConversation: nextRunStatus,
       activeSessionIdByConversation: {
@@ -267,6 +300,13 @@ function applyRecoveredRunState(
         [conversationId]: null,
       },
     };
+    if (plan !== undefined) {
+      nextState.planByConversation = {
+        ...state.planByConversation,
+        [conversationId]: plan,
+      };
+    }
+    return nextState;
   }
 
   const nextState: ChatState = {
@@ -286,9 +326,17 @@ function applyRecoveredRunState(
     activeApprovalByConversation: {
       ...state.activeApprovalByConversation,
       [conversationId]:
-        pendingApproval !== null ? activeApprovalFromPending(pendingApproval) : null,
+        pendingApproval !== null
+          ? activeApprovalFromPending(pendingApproval, patchPreview)
+          : null,
     },
   };
+  if (plan !== undefined) {
+    nextState.planByConversation = {
+      ...state.planByConversation,
+      [conversationId]: plan,
+    };
+  }
   return nextState;
 }
 
@@ -428,6 +476,8 @@ export function reduceChatState(state: ChatState, action: ChatAction): ChatState
         action.conversationId,
         action.state.latest_run,
         action.state.pending_approval,
+        action.state.patch_preview ?? null,
+        parseConversationPlan(action.state.plan),
       );
     case "event.received": {
       if (!isValidEventEnvelope(action.event)) {
@@ -472,7 +522,6 @@ export function reduceChatState(state: ChatState, action: ChatAction): ChatState
           };
           break;
         case "approval.requested": {
-          const approval = approvalFromEvent(event);
           nextState = {
             ...nextState,
             runStatusByConversation: {
@@ -485,7 +534,7 @@ export function reduceChatState(state: ChatState, action: ChatAction): ChatState
             },
             activeApprovalByConversation: {
               ...nextState.activeApprovalByConversation,
-              [conversationId]: approval,
+              [conversationId]: null,
             },
           };
           break;
@@ -561,6 +610,19 @@ export function reduceChatState(state: ChatState, action: ChatAction): ChatState
             },
           };
           break;
+        case "plan.updated": {
+          const plan = parseConversationPlan(event.data);
+          if (plan !== null) {
+            nextState = {
+              ...nextState,
+              planByConversation: {
+                ...nextState.planByConversation,
+                [conversationId]: plan,
+              },
+            };
+          }
+          break;
+        }
         default:
           break;
       }

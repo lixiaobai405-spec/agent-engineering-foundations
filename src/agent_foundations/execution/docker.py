@@ -3,16 +3,17 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from agent_foundations.execution.backend import (
     BackendLaunchError,
     BackendUnavailableError,
     ExecutionConflictError,
 )
-from agent_foundations.execution.models import ExecutionRequest, ExecutionResult
+from agent_foundations.execution.models import ByteStreamSink, ExecutionRequest, ExecutionResult
+from agent_foundations.execution.sandbox_manifest import SandboxManifest
 
 SANDBOX_IMAGE = "agent-foundations-sandbox:phase2"
 logger = logging.getLogger(__name__)
@@ -107,7 +108,13 @@ async def _spawn_docker(argv: tuple[str, ...]) -> _Process:
 
 
 class DockerCommandBuilder:
-    def __init__(self, workspace_root: Path, *, docker_executable: str = "docker") -> None:
+    def __init__(
+        self,
+        workspace_root: Path,
+        *,
+        docker_executable: str = "docker",
+        sandbox_manifest: SandboxManifest | None = None,
+    ) -> None:
         try:
             resolved = workspace_root.resolve(strict=True)
         except (OSError, ValueError) as exc:
@@ -121,6 +128,7 @@ class DockerCommandBuilder:
         self._validate_mount_source(resolved)
         self.workspace_root = resolved
         self._docker_executable = docker_executable
+        self._sandbox_manifest = sandbox_manifest
 
     def build(self, request: ExecutionRequest) -> tuple[str, ...]:
         cwd = self._resolve_cwd(request.cwd)
@@ -128,10 +136,18 @@ class DockerCommandBuilder:
         container_cwd = "/workspace"
         if relative.parts:
             container_cwd += "/" + relative.as_posix()
-        mount = f"type=bind,source={self.workspace_root},target=/workspace"
-        if request.mount_mode == "read_only":
+        snapshot_mode = request.mount_mode == "snapshot"
+        target = "/project-ro" if snapshot_mode else "/workspace"
+        mount = f"type=bind,source={self.workspace_root},target={target}"
+        if request.mount_mode in {"read_only", "snapshot"}:
             mount += ",readonly"
-        return (
+        image = SANDBOX_IMAGE
+        if snapshot_mode:
+            if self._sandbox_manifest is None:
+                raise ValueError("snapshot execution requires a trusted sandbox manifest")
+            image = self._sandbox_manifest.profile(request.sandbox_profile).final_image_id
+
+        runtime: tuple[str, ...] = (
             self._docker_executable,
             "run",
             "--rm",
@@ -156,11 +172,19 @@ class DockerCommandBuilder:
             "1.0",
             "--mount",
             mount,
-            "--workdir",
-            container_cwd,
-            SANDBOX_IMAGE,
-            *request.argv,
         )
+        if snapshot_mode:
+            runtime += (
+                "--tmpfs",
+                (
+                    "/workspace:rw,nosuid,nodev,size=536870912,mode=0755,"
+                    "uid=65532,gid=65532"
+                ),
+            )
+        env_flags: tuple[str, ...] = ()
+        for key, value in request.env:
+            env_flags += ("-e", f"{key}={value}")
+        return runtime + env_flags + ("--workdir", container_cwd, image, *request.argv)
 
     def _resolve_cwd(self, relative_cwd: str) -> Path:
         try:
@@ -203,6 +227,7 @@ class _ActiveExecution:
 class _OutputBudget:
     remaining: int
     truncated: bool = False
+    stop: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class DockerBackend:
@@ -212,8 +237,12 @@ class DockerBackend:
         *,
         process_factory: ProcessFactory = _spawn_docker,
         cleanup_factory: ProcessFactory = _spawn_docker,
+        sandbox_manifest: SandboxManifest | None = None,
     ) -> None:
-        self._builder = DockerCommandBuilder(workspace_root)
+        self._builder = DockerCommandBuilder(
+            workspace_root,
+            sandbox_manifest=sandbox_manifest,
+        )
         self._process_factory = process_factory
         self._cleanup_factory = cleanup_factory
         self._active: dict[str, _ActiveExecution] = {}
@@ -223,7 +252,12 @@ class DockerBackend:
     def active_execution_ids(self) -> tuple[str, ...]:
         return tuple(sorted(self._active))
 
-    async def execute(self, request: ExecutionRequest) -> ExecutionResult:
+    async def execute(
+        self,
+        request: ExecutionRequest,
+        *,
+        output_sink: ByteStreamSink | None = None,
+    ) -> ExecutionResult:
         argv = self._builder.build(request)
         active = _ActiveExecution()
         async with self._lock:
@@ -249,17 +283,30 @@ class DockerBackend:
             stderr = bytearray()
             stderr_probe = bytearray()
             active.drain_tasks = (
-                asyncio.create_task(self._drain(process.stdout, stdout, budget)),
+                asyncio.create_task(
+                    self._drain(
+                        process.stdout,
+                        stdout,
+                        budget,
+                        stream="stdout",
+                        sink=output_sink,
+                    )
+                ),
                 asyncio.create_task(
                     self._drain(
                         process.stderr,
                         stderr,
                         budget,
                         diagnostic_probe=stderr_probe,
+                        stream="stderr",
+                        sink=output_sink,
                     )
                 ),
             )
             timed_out = False
+            limit_stop = asyncio.create_task(
+                self._stop_when_truncated(budget, request.execution_id, active)
+            )
             try:
                 exit_code = await asyncio.wait_for(
                     process.wait(),
@@ -269,12 +316,17 @@ class DockerBackend:
                 timed_out = True
                 await self._abort_and_cleanup(request.execution_id, active)
                 exit_code = None
+            finally:
+                limit_stop.cancel()
+                await asyncio.gather(limit_stop, return_exceptions=True)
             await asyncio.gather(*active.drain_tasks)
             cancelled = active.cancelled and not timed_out
             if cancelled:
                 await self._cleanup_exact(request.execution_id, active)
                 exit_code = None
             stderr_bytes = bytes(stderr)
+            captured_stdout = b"" if output_sink is not None else bytes(stdout)
+            captured_stderr = b"" if output_sink is not None else stderr_bytes
             if not timed_out and not cancelled and exit_code == 125:
                 diagnostic = bytes(stderr_probe).lower()
                 if any(marker in diagnostic for marker in _UNAVAILABLE_MARKERS):
@@ -285,8 +337,8 @@ class DockerBackend:
             return ExecutionResult(
                 execution_id=request.execution_id,
                 exit_code=exit_code,
-                stdout=bytes(stdout),
-                stderr=stderr_bytes,
+                stdout=captured_stdout,
+                stderr=captured_stderr,
                 timed_out=timed_out,
                 cancelled=cancelled,
                 output_truncated=budget.truncated,
@@ -437,6 +489,15 @@ class DockerBackend:
         finally:
             writer.close()
 
+    async def _stop_when_truncated(
+        self,
+        budget: _OutputBudget,
+        execution_id: str,
+        active: _ActiveExecution,
+    ) -> None:
+        await budget.stop.wait()
+        await self._abort_and_cleanup(execution_id, active)
+
     @staticmethod
     async def _drain(
         reader: _Readable | None,
@@ -444,6 +505,8 @@ class DockerBackend:
         budget: _OutputBudget,
         *,
         diagnostic_probe: bytearray | None = None,
+        stream: str = "stdout",
+        sink: ByteStreamSink | None = None,
     ) -> None:
         if reader is None:
             return
@@ -454,6 +517,24 @@ class DockerBackend:
             if diagnostic_probe is not None and len(diagnostic_probe) < 4096:
                 remaining_probe = 4096 - len(diagnostic_probe)
                 diagnostic_probe.extend(chunk[:remaining_probe])
+            if sink is not None:
+                name: Literal["stdout", "stderr"] = (
+                    "stderr" if stream == "stderr" else "stdout"
+                )
+                if budget.remaining <= 0:
+                    budget.truncated = True
+                    budget.stop.set()
+                    return
+                accepted = chunk[: budget.remaining]
+                budget.remaining -= len(accepted)
+                accepted_ok = True
+                if accepted:
+                    accepted_ok = sink.feed(name, accepted)
+                if (not accepted_ok) or len(accepted) < len(chunk):
+                    budget.truncated = True
+                    budget.stop.set()
+                    return
+                continue
             keep = min(len(chunk), budget.remaining)
             if keep:
                 target.extend(chunk[:keep])

@@ -32,7 +32,9 @@ describe("ApprovalCard", () => {
     tool_name: "read_file",
     canonical_path: "/tmp/external.txt",
     operation: "read",
+    resource_kind: "project_path",
     scope: "external_exact_path",
+    policy_decision: "ask",
   };
 
   const approvalEvent = makeEvent({
@@ -44,7 +46,9 @@ describe("ApprovalCard", () => {
       tool_name: approvalView.tool_name,
       canonical_path: approvalView.canonical_path,
       operation: approvalView.operation,
+      resource_kind: approvalView.resource_kind,
       scope: approvalView.scope,
+      policy_decision: approvalView.policy_decision,
     },
   });
 
@@ -66,9 +70,77 @@ describe("ApprovalCard", () => {
     expect(within(card).getByText("/tmp/external.txt")).toBeInTheDocument();
     expect(within(card).getByText("read")).toBeInTheDocument();
     expect(within(card).getByText(/external exact path/i)).toBeInTheDocument();
+    expect(within(card).getByText(/Policy: ask/i)).toBeInTheDocument();
+    expect(within(card).getByText(/Resource: project_path/i)).toBeInTheDocument();
     expect(within(card).getByText(/one-time/i)).toBeInTheDocument();
     expect(within(card).getByRole("button", { name: "Approve once" })).toBeEnabled();
     expect(within(card).getByRole("button", { name: "Deny" })).toBeEnabled();
+  });
+
+  it("shows controlled command approval copy instead of external read", () => {
+    render(
+      <ApprovalCard
+        approval={{
+          approval_id: "approval-command",
+          tool_call_id: "call-command",
+          tool_name: "run_command",
+          canonical_path: "command:run_command",
+          operation: "run",
+          resource_kind: "sandbox_command",
+          scope: "project_internal",
+          policy_decision: "ask",
+        }}
+        disabled={false}
+        onDecision={vi.fn()}
+      />,
+    );
+
+    const card = screen.getByRole("article", { name: "Approval request" });
+    expect(within(card).getByText("Controlled command approval")).toBeInTheDocument();
+    expect(within(card).getByText("run_command")).toBeInTheDocument();
+    expect(within(card).getByText("run")).toBeInTheDocument();
+    expect(within(card).getAllByText("sandbox_command").length).toBeGreaterThan(0);
+    expect(within(card).getByText(/project internal/i)).toBeInTheDocument();
+    expect(within(card).getByText(/Policy: ask/i)).toBeInTheDocument();
+    expect(within(card).getByText(/Resource: sandbox_command/i)).toBeInTheDocument();
+    expect(within(card).getByText(/Docker sandbox/i)).toBeInTheDocument();
+    expect(within(card).queryByText("External read approval")).toBeNull();
+    expect(within(card).queryByText(/external exact path/i)).toBeNull();
+    expect(within(card).queryByText(/read only/i)).toBeNull();
+  });
+
+  it("does not treat a missing resource_kind as External read", () => {
+    const incomplete = makeEvent({
+      conversation_id: "11111111-1111-4111-8111-111111111111",
+      type: "approval.requested",
+      data: {
+        approval_id: approvalView.approval_id,
+        tool_call_id: approvalView.tool_call_id,
+        tool_name: "read_file",
+        canonical_path: approvalView.canonical_path,
+        operation: "read",
+        scope: "external_exact_path",
+      },
+    });
+    expect(parseApprovalFromEvent(incomplete)).toBeNull();
+
+    render(
+      <ApprovalCard
+        approval={{
+          approval_id: "approval-unknown",
+          tool_call_id: "call-unknown",
+          tool_name: "mystery_tool",
+          canonical_path: "/tmp/mystery.txt",
+          operation: "read",
+          scope: "external_exact_path",
+        }}
+        disabled={false}
+        onDecision={vi.fn()}
+      />,
+    );
+    const card = screen.getByRole("article", { name: "Approval request" });
+    expect(within(card).queryByText("External read approval")).toBeNull();
+    expect(within(card).getByText("Approval request")).toBeInTheDocument();
   });
 
   it("disables both buttons immediately after a decision starts", async () => {

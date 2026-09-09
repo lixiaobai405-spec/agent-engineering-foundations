@@ -31,7 +31,7 @@ def _require_application_migrations_v5() -> None:
     from agent_foundations.storage.migrations import get_application_migrations
 
     migrations = get_application_migrations()
-    assert len(migrations) == 7
+    assert len(migrations) == 10
     assert migrations[4].version == 5
 
 
@@ -513,7 +513,7 @@ async def test_user_version_six_is_rejected(tmp_path: Path) -> None:
 
     path = tmp_path / "future.sqlite3"
     connection = sqlite3.connect(path)
-    connection.execute("PRAGMA user_version = 8")
+    connection.execute("PRAGMA user_version = 11")
     connection.commit()
     connection.close()
     database = SqliteDatabase(path, get_application_migrations())

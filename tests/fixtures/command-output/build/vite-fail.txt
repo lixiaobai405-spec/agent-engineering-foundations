@@ -1,0 +1,4 @@
+error during build:
+Could not resolve './missing'
+    at vite build
+✘ [ERROR] Could not resolve "./missing"

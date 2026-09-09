@@ -3,8 +3,9 @@ import { useState } from "react";
 import type {
   Conversation,
   CreateConversationRequest,
-  PermissionMode,
+  PermissionProfile,
 } from "../state/types";
+import { PermissionProfileSelect } from "./PermissionProfileSelect";
 
 export function ConversationList({
   conversations,
@@ -20,8 +21,8 @@ export function ConversationList({
   const [showForm, setShowForm] = useState(false);
   const [title, setTitle] = useState("");
   const [projectRoot, setProjectRoot] = useState("");
-  const [permissionMode, setPermissionMode] =
-    useState<PermissionMode>("PROJECT_READ_ONLY");
+  const [permissionProfile, setPermissionProfile] =
+    useState<PermissionProfile>("PROJECT_READ_ONLY");
   const [submitting, setSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -38,11 +39,11 @@ export function ConversationList({
       await onCreate({
         title: trimmedTitle,
         project_root: trimmedRoot,
-        permission_mode: permissionMode,
+        permission_profile: permissionProfile,
       });
       setTitle("");
       setProjectRoot("");
-      setPermissionMode("PROJECT_READ_ONLY");
+      setPermissionProfile("PROJECT_READ_ONLY");
       setShowForm(false);
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Failed to create conversation");
@@ -70,17 +71,11 @@ export function ConversationList({
             value={projectRoot}
             onChange={(event) => setProjectRoot(event.target.value)}
           />
-          <label htmlFor="conversation-permission-mode">Permission mode</label>
-          <select
-            id="conversation-permission-mode"
-            value={permissionMode}
-            onChange={(event) =>
-              setPermissionMode(event.target.value as PermissionMode)
-            }
-          >
-            <option value="PROJECT_READ_ONLY">PROJECT_READ_ONLY</option>
-            <option value="ASK_FOR_ACCESS">ASK_FOR_ACCESS</option>
-          </select>
+          <PermissionProfileSelect
+            value={permissionProfile}
+            disabled={submitting}
+            onChange={setPermissionProfile}
+          />
           <button type="submit" disabled={submitting}>
             Create conversation
           </button>
@@ -102,7 +97,9 @@ export function ConversationList({
             >
               <span className="conversation-list__title">{conversation.title}</span>
               <span className="conversation-list__root">{conversation.project_root}</span>
-              <span className="conversation-list__mode">{conversation.permission_mode}</span>
+              <span className="conversation-list__mode">
+                {conversation.permission_profile}
+              </span>
             </button>
           </li>
         ))}

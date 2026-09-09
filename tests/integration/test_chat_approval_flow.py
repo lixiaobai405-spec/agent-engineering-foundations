@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agent_foundations.chat.approvals import ApprovalCoordinator
-from agent_foundations.chat.errors import ChatNotFoundError
+from agent_foundations.chat.errors import ChatConflictError, ChatNotFoundError
 from agent_foundations.chat.events import ChatEventBroker
 from agent_foundations.chat.models import (
     AccessOperation,
@@ -31,12 +31,12 @@ from agent_foundations.chat.supervisor import RunSupervisor
 from agent_foundations.context.budget import ContextBudget
 from agent_foundations.context.builder import ContextBuilder
 from agent_foundations.domain.model import ModelResponse
-from agent_foundations.domain.tool import ToolCall
+from agent_foundations.domain.tool import ToolCall, ToolResult
 from agent_foundations.providers.fake import FakeModelProvider
 from agent_foundations.runtime.agent import AgentConfig
 from agent_foundations.runtime.loop import AgentLoop
 from agent_foundations.runtime.redaction import Redactor
-from agent_foundations.runtime.tool_execution import ToolCallExecutor
+from agent_foundations.runtime.tool_execution import ToolCallExecutor, ToolExecutionContext
 from agent_foundations.runtime.trace import EventSink
 from agent_foundations.security.approvals import AuthorizationStatus
 from agent_foundations.security.models import (
@@ -49,6 +49,7 @@ from agent_foundations.security.models import (
 )
 from agent_foundations.security.policy import PolicyEngine
 from agent_foundations.tools.filesystem.read_file import READ_FILE_MANIFEST
+from agent_foundations.tools.patch.apply_patch import ApplyPatchTool
 from agent_foundations.viewer.app import create_app
 from tests.unit.tools.registry_helpers import readonly_tool_registry
 
@@ -643,3 +644,98 @@ def test_capability_insert_failure_can_resume_exact_approved_legacy_request(
             approval.approval_id,
         ),
     ) == 1
+
+
+@pytest.mark.asyncio
+async def test_chat_patch_approval_bridge_is_one_time_and_uses_safe_metadata(
+    tmp_path: Path,
+) -> None:
+    from agent_foundations.chat.tool_execution import ChatControlledToolExecutor
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    repository = ConversationRepository(tmp_path / "state.sqlite3")
+    await repository.initialize()
+    broker = RecordingBroker()
+    coordinator = ApprovalCoordinator(repository, broker)
+    conversation = await repository.create_conversation(
+        title="Patch approval",
+        project_root=project_root,
+        permission_profile=PermissionProfileName.ASK_ALWAYS,
+    )
+    session_id = str(uuid4())
+    _message, run = await repository.begin_run(
+        conversation.conversation_id,
+        content="apply it",
+        session_id=session_id,
+    )
+    await repository.transition_run(session_id, RunStatus.QUEUED, RunStatus.RUNNING)
+
+    class StubControlled:
+        def __init__(self, authorized: bool) -> None:
+            self.authorized = authorized
+
+        async def execute(
+            self,
+            tool: Any,
+            arguments: dict[str, Any],
+            context: ToolExecutionContext,
+        ) -> ToolResult:
+            del tool, arguments, context
+            if not self.authorized:
+                return ToolResult(
+                    success=False,
+                    content="approval pending",
+                    error_code="APPROVAL_REQUIRED",
+                )
+            return ToolResult(
+                success=True,
+                content="patch applied",
+                metadata={"backend": "docker", "mount_mode": "project_write"},
+            )
+
+    executor = ChatControlledToolExecutor(
+        StubControlled(False),
+        conversation,
+        coordinator,
+        lambda decider: cast(ToolCallExecutor, StubControlled(decider is not None)),
+    )
+    execution = asyncio.create_task(
+        executor.execute(
+            ApplyPatchTool(),
+            {"patch_id": "a" * 64},
+            ToolExecutionContext(
+                session_id=session_id,
+                root=project_root,
+                tool_call_id="patch-call",
+                tool_name="apply_patch",
+            ),
+        ),
+    )
+    approval: ApprovalRequest | None = None
+    for _ in range(100):
+        _latest, approval = await repository.get_conversation_state(
+            conversation.conversation_id,
+        )
+        if approval is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert approval is not None
+    assert approval.operation is AccessOperation.APPLY
+    assert approval.canonical_path == f"patch:{'a' * 64}"
+    requested = next(
+        event for event in broker.events if event.type is ChatEventType.APPROVAL_REQUESTED
+    )
+    serialized = requested.model_dump_json()
+    assert "diff" not in serialized.lower()
+    assert "source" not in requested.data
+    assert requested.data["resource_kind"] == "project_path"
+    assert requested.data["operation"] == "apply"
+    assert "capability_id" not in requested.data
+
+    await coordinator.resolve(approval.approval_id, ApprovalDecision.APPROVE)
+    result = await execution
+    assert result.success is True
+    assert result.metadata == {"backend": "docker", "mount_mode": "project_write"}
+    with pytest.raises(ChatConflictError):
+        await coordinator.resolve(approval.approval_id, ApprovalDecision.APPROVE)

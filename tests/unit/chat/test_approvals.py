@@ -255,8 +255,11 @@ async def test_approval_events_contain_safe_metadata_only(tmp_path: Path) -> Non
         "tool_name": "read_file",
         "canonical_path": "/outside/project/secret.txt",
         "operation": "read",
+        "resource_kind": "project_path",
         "scope": "external_exact_path",
+        "policy_decision": "ask",
     }
+    assert "capability_id" not in requested["data"]
     assert resolved["data"] == {
         "approval_id": APPROVAL_ID,
         "status": "approved",
@@ -265,6 +268,134 @@ async def test_approval_events_contain_safe_metadata_only(tmp_path: Path) -> Non
     assert "do-not-leak" not in serialized
     assert "Traceback" not in serialized
     assert "api_key" not in serialized.lower()
+
+
+@pytest.mark.asyncio
+async def test_run_command_approval_event_uses_project_internal_scope(
+    tmp_path: Path,
+) -> None:
+    ApprovalCoordinator, ApprovalDecision = _require_coordinator()
+    repository = await _open_repository(tmp_path / "chat.sqlite3")
+    conversation_id, session_id = await _running_run(repository, tmp_path)
+    broker = RecordingBroker()
+    coordinator = ApprovalCoordinator(repository, broker)
+    request = ApprovalRequest(
+        approval_id=APPROVAL_ID_B,
+        conversation_id=conversation_id,
+        session_id=session_id,
+        tool_call_id="tool-call-command",
+        tool_name="run_command",
+        canonical_path="command:run_command",
+        operation=AccessOperation.READ,
+        status=ApprovalStatus.PENDING,
+    )
+
+    waiter = asyncio.create_task(coordinator.request(request))
+    await _wait_for_pending(repository, request.approval_id)
+    await coordinator.resolve(request.approval_id, ApprovalDecision.APPROVE)
+    assert await waiter is ApprovalStatus.APPROVED
+
+    requested = broker.events[0].model_dump(mode="json")
+    assert requested["data"]["tool_name"] == "run_command"
+    assert requested["data"]["operation"] == "run"
+    assert requested["data"]["resource_kind"] == "sandbox_command"
+    assert requested["data"]["scope"] == "project_internal"
+    assert requested["data"]["policy_decision"] == "ask"
+    assert requested["data"]["scope"] != "external_exact_path"
+    assert "capability_id" not in requested["data"]
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_approval_event_uses_project_path_apply(
+    tmp_path: Path,
+) -> None:
+    ApprovalCoordinator, ApprovalDecision = _require_coordinator()
+    repository = await _open_repository(tmp_path / "chat.sqlite3")
+    conversation_id, session_id = await _running_run(repository, tmp_path)
+    broker = RecordingBroker()
+    coordinator = ApprovalCoordinator(repository, broker)
+    request = ApprovalRequest(
+        approval_id=APPROVAL_ID_B,
+        conversation_id=conversation_id,
+        session_id=session_id,
+        tool_call_id="tool-call-patch",
+        tool_name="apply_patch",
+        canonical_path="patch:0123456789abcdef",
+        operation=AccessOperation.APPLY,
+        status=ApprovalStatus.PENDING,
+    )
+
+    waiter = asyncio.create_task(coordinator.request(request))
+    await _wait_for_pending(repository, request.approval_id)
+    await coordinator.resolve(request.approval_id, ApprovalDecision.APPROVE)
+    assert await waiter is ApprovalStatus.APPROVED
+
+    requested = broker.events[0].model_dump(mode="json")
+    assert requested["data"]["operation"] == "apply"
+    assert requested["data"]["resource_kind"] == "project_path"
+    assert requested["data"]["scope"] == "project_internal"
+    assert requested["data"]["policy_decision"] == "ask"
+    assert "capability_id" not in requested["data"]
+
+
+def test_pending_approval_state_maps_sqlite_read_run_command_to_policy_view() -> None:
+    from agent_foundations.chat.api import _pending_approval_state
+
+    approval = ApprovalRequest(
+        approval_id=APPROVAL_ID,
+        conversation_id=CONVERSATION_ID,
+        session_id=SESSION_ID,
+        tool_call_id="call-command",
+        tool_name="run_command",
+        canonical_path="command:run_command",
+        operation=AccessOperation.READ,
+        status=ApprovalStatus.PENDING,
+    )
+    state = _pending_approval_state(approval)
+    payload = state.model_dump(mode="json")
+    assert payload["operation"] == "run"
+    assert payload["resource_kind"] == "sandbox_command"
+    assert payload["scope"] == "project_internal"
+    assert payload["policy_decision"] == "ask"
+    assert "capability_id" not in payload
+
+
+def test_pending_approval_state_maps_apply_and_external_read() -> None:
+    from agent_foundations.chat.api import _pending_approval_state
+
+    patch = _pending_approval_state(
+        ApprovalRequest(
+            approval_id=APPROVAL_ID,
+            conversation_id=CONVERSATION_ID,
+            session_id=SESSION_ID,
+            tool_call_id="call-patch",
+            tool_name="apply_patch",
+            canonical_path="patch:abc",
+            operation=AccessOperation.APPLY,
+            status=ApprovalStatus.PENDING,
+        )
+    ).model_dump(mode="json")
+    assert patch["operation"] == "apply"
+    assert patch["resource_kind"] == "project_path"
+    assert patch["scope"] == "project_internal"
+    assert patch["policy_decision"] == "ask"
+
+    external = _pending_approval_state(
+        ApprovalRequest(
+            approval_id=APPROVAL_ID_B,
+            conversation_id=CONVERSATION_ID,
+            session_id=SESSION_ID,
+            tool_call_id="call-read",
+            tool_name="read_file",
+            canonical_path="/outside/secret.txt",
+            operation=AccessOperation.READ,
+            status=ApprovalStatus.PENDING,
+        )
+    ).model_dump(mode="json")
+    assert external["operation"] == "read"
+    assert external["resource_kind"] == "project_path"
+    assert external["scope"] == "external_exact_path"
+    assert external["policy_decision"] == "ask"
 
 
 @pytest.mark.asyncio
@@ -851,3 +982,143 @@ async def test_publish_failure_invalidates_approval_and_cleans_waiter(
 
     with pytest.raises(ChatConflictError):
         await coordinator.resolve(request.approval_id, ApprovalDecision.APPROVE)
+
+
+@pytest.mark.asyncio
+async def test_chat_and_trace_sse_generate_swallows_cancelled_error(
+    tmp_path: Path,
+) -> None:
+    from collections.abc import AsyncGenerator
+    from typing import cast
+    from uuid import UUID
+
+    from fastapi.responses import StreamingResponse
+    from fastapi.routing import APIRoute
+    from starlette.requests import Request
+    from starlette.types import Message
+
+    from agent_foundations.chat.api import ChatServices, create_chat_router
+    from agent_foundations.chat.approvals import ApprovalCoordinator
+    from agent_foundations.chat.runner import ConversationRunner, direct_executor_factory
+    from agent_foundations.chat.supervisor import RunSupervisor
+    from agent_foundations.context.budget import ContextBudget
+    from agent_foundations.context.builder import ContextBuilder
+    from agent_foundations.domain.model import ModelResponse
+    from agent_foundations.providers.fake import FakeModelProvider
+    from agent_foundations.runtime.agent import AgentConfig
+    from agent_foundations.runtime.loop import AgentLoop
+    from agent_foundations.runtime.redaction import Redactor
+    from agent_foundations.runtime.tool_execution import ToolCallExecutor
+    from agent_foundations.runtime.trace import EventSink
+    from agent_foundations.tools.filesystem.path_policy import PathPolicy
+    from agent_foundations.tools.registry import ToolRegistry, build_standard_registered_tools
+    from agent_foundations.viewer.app import create_app
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    class CancellingRequest(Request):
+        async def is_disconnected(self) -> bool:
+            raise asyncio.CancelledError()
+
+    def asgi_request(path: str, query: bytes = b"") -> Request:
+        return CancellingRequest(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.3"},
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": path,
+                "raw_path": path.encode(),
+                "query_string": query,
+                "root_path": "",
+                "headers": [],
+                "client": ("127.0.0.1", 50000),
+                "server": ("127.0.0.1", 8765),
+            },
+            receive,
+        )
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    repository = await _open_repository(tmp_path / "chat.sqlite3")
+    broker = ChatEventBroker()
+    supervisor = RunSupervisor()
+    provider = FakeModelProvider([ModelResponse(content="unused")])
+
+    def runtime_factory(
+        conversation: object,
+        event_sink: EventSink,
+        tool_executor: ToolCallExecutor,
+    ) -> AgentLoop:
+        del conversation, tool_executor
+        return AgentLoop(
+            provider=provider,
+            registry=ToolRegistry(
+                build_standard_registered_tools(PathPolicy(project_root)),
+            ),
+            context_builder=ContextBuilder(ContextBudget()),
+            event_sink=event_sink,
+            config=AgentConfig(),
+        )
+
+    runner = ConversationRunner(
+        repository=repository,
+        broker=broker,
+        runtime_factory=runtime_factory,
+        trace_dir=tmp_path / "traces",
+        redactor_factory=lambda conversation: Redactor(
+            Path(conversation.project_root),
+        ),
+        tool_executor_factory=direct_executor_factory,
+    )
+    services = ChatServices(
+        repository=repository,
+        broker=broker,
+        runner=runner,
+        supervisor=supervisor,
+        coordinator=ApprovalCoordinator(repository, broker),
+    )
+    conversation = await repository.create_conversation(
+        title="SSE cancel",
+        project_root=project_root,
+        permission_mode=PermissionMode.PROJECT_READ_ONLY,
+    )
+    router = create_chat_router(services, keepalive_seconds=0.05)
+    route = next(
+        item
+        for item in router.routes
+        if isinstance(item, APIRoute)
+        and item.path == "/conversations/{conversation_id}/events"
+    )
+    request = asgi_request(
+        f"/api/chat/conversations/{conversation.conversation_id}/events",
+    )
+    response = cast(
+        StreamingResponse,
+        await route.endpoint(request, UUID(conversation.conversation_id)),
+    )
+    stream = cast(AsyncGenerator[str, None], response.body_iterator)
+    assert await anext(stream) == ": connected\n\n"
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+    await stream.aclose()
+    await supervisor.shutdown()
+
+    app = create_app(tmp_path / "traces")
+    trace_route = next(
+        item
+        for item in app.routes
+        if isinstance(item, APIRoute) and item.path == "/api/events/stream"
+    )
+    trace_request = asgi_request("/api/events/stream")
+    trace_response = cast(
+        StreamingResponse,
+        await trace_route.endpoint(trace_request, "*"),
+    )
+    trace_stream = cast(AsyncGenerator[str, None], trace_response.body_iterator)
+    assert await anext(trace_stream) == ": connected\n\n"
+    with pytest.raises(StopAsyncIteration):
+        await anext(trace_stream)
+    await trace_stream.aclose()

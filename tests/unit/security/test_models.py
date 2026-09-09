@@ -164,3 +164,19 @@ def test_policy_request_binds_required_fields() -> None:
     assert request.profile_version == 1
     assert request.run_id == "run-1"
     assert request.tool_call_id == "call-1"
+
+
+def test_readonly_profile_includes_isolated_git_read_tools() -> None:
+    _require_security_models()
+    from agent_foundations.security.models import (
+        PHASE2C_READONLY_TOOLS,
+        PermissionProfileName,
+        default_allowed_tools,
+    )
+
+    git_tools = ("git_status", "git_diff", "git_log")
+    assert git_tools == PHASE2C_READONLY_TOOLS[-3:]
+    allowed = default_allowed_tools(PermissionProfileName.PROJECT_READ_ONLY)
+    assert git_tools == allowed[-3:]
+    assert "git_commit" not in allowed
+    assert "run_command" not in allowed

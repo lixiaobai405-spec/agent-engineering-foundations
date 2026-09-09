@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from agent_foundations.execution.models import ExecutionRequest, ExecutionResult
+from agent_foundations.execution.models import ByteStreamSink, ExecutionRequest, ExecutionResult
 
 
 class ExecutionBackendError(RuntimeError):
@@ -22,6 +22,11 @@ class BackendLaunchError(ExecutionBackendError):
 
 
 class ExecutionBackend(Protocol):
-    async def execute(self, request: ExecutionRequest) -> ExecutionResult: ...
+    async def execute(
+        self,
+        request: ExecutionRequest,
+        *,
+        output_sink: ByteStreamSink | None = None,
+    ) -> ExecutionResult: ...
 
     async def cancel(self, execution_id: str) -> None: ...

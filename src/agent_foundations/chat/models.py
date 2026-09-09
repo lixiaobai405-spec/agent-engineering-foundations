@@ -18,6 +18,7 @@ from pydantic import (
 
 from agent_foundations.domain._freeze import FrozenJSON, to_json_value
 from agent_foundations.domain._model import ValidatedCopyModel
+from agent_foundations.security.models import PermissionProfileName
 
 
 def utc_now() -> datetime:
@@ -72,6 +73,7 @@ class ResourceKind(StrEnum):
 
 class AccessOperation(StrEnum):
     READ = "read"
+    APPLY = "apply"
 
 
 class AccessScope(StrEnum):
@@ -137,6 +139,7 @@ class ChatEventType(StrEnum):
     ASSISTANT_MESSAGE_COMPLETED = "assistant.message.completed"
     RUN_COMPLETED = "run.completed"
     RUN_FAILED = "run.failed"
+    PLAN_UPDATED = "plan.updated"
 
 
 class ChatModel(ValidatedCopyModel):
@@ -156,6 +159,8 @@ class Conversation(ChatModel):
     title: str = Field(min_length=1, max_length=120)
     project_root: str
     permission_mode: PermissionMode
+    permission_profile: PermissionProfileName = PermissionProfileName.PROJECT_READ_ONLY
+    profile_version: int = Field(default=1, ge=1)
     created_at: UTCDateTime = Field(default_factory=utc_now)
     updated_at: UTCDateTime = Field(default_factory=utc_now)
 

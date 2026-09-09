@@ -1,0 +1,5 @@
+[project]
+name = "phase2-coding-fixture"
+version = "0.1.0"
+description = "Fictional coding project for Phase 2 Offline Eval and FakeModel E2E"
+requires-python = ">=3.12"

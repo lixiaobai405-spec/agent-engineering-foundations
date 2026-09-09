@@ -20,6 +20,20 @@ async def test_reads_numbered_line_range() -> None:
     assert result.metadata["truncated"] is True
 
 
+def test_read_lines_crlf_has_no_carriage_returns(tmp_path: Path) -> None:
+    (tmp_path / "notes.txt").write_bytes(b"alpha\r\nbeta\r\n")
+    tool = ReadFileTool(PathPolicy(tmp_path))
+    lines = tool.read_lines("notes.txt")
+    assert lines == ("alpha", "beta")
+    assert all("\r" not in line and "\n" not in line for line in lines)
+
+
+def test_read_lines_empty_file_is_zero_lines(tmp_path: Path) -> None:
+    (tmp_path / "empty.txt").write_bytes(b"")
+    tool = ReadFileTool(PathPolicy(tmp_path))
+    assert tool.read_lines("empty.txt") == ()
+
+
 def test_read_lines_returns_complete_bounded_file(tmp_path: Path) -> None:
     lines = [f"line-{number}" for number in range(1, 551)]
     (tmp_path / "long.txt").write_text("\n".join(lines), encoding="utf-8")

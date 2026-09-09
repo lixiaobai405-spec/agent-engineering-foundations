@@ -105,6 +105,45 @@ class ToolRegistry:
         return await tool.execute(normalized)
 
 
+def build_git_read_registered_tools(
+    service: Any,
+    policy: PathPolicy,
+) -> tuple[RegisteredTool, ...]:
+    from agent_foundations.tools.git.diff import (
+        GIT_DIFF_MANIFEST,
+        GitDiffTool,
+        resolve_git_diff_resource,
+    )
+    from agent_foundations.tools.git.log import (
+        GIT_LOG_MANIFEST,
+        GitLogTool,
+        resolve_git_log_resource,
+    )
+    from agent_foundations.tools.git.status import (
+        GIT_STATUS_MANIFEST,
+        GitStatusTool,
+        resolve_git_status_resource,
+    )
+
+    return (
+        RegisteredTool(
+            GitStatusTool(service),
+            GIT_STATUS_MANIFEST,
+            resolve_git_status_resource,
+        ),
+        RegisteredTool(
+            GitDiffTool(service),
+            GIT_DIFF_MANIFEST,
+            lambda arguments: resolve_git_diff_resource(arguments, policy),
+        ),
+        RegisteredTool(
+            GitLogTool(service),
+            GIT_LOG_MANIFEST,
+            resolve_git_log_resource,
+        ),
+    )
+
+
 def build_readonly_filesystem_registered_tools(
     policy: PathPolicy,
 ) -> tuple[RegisteredTool, ...]:

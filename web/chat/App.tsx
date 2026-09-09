@@ -3,6 +3,8 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "r
 import { ChatComposer } from "./components/ChatComposer";
 import { ConversationList } from "./components/ConversationList";
 import { MessageTimeline } from "./components/MessageTimeline";
+import { PermissionProfileSelect } from "./components/PermissionProfileSelect";
+import { PlanPanel } from "./components/PlanPanel";
 import {
   ChatApiError,
   createConversation,
@@ -15,14 +17,15 @@ import {
   listRuns,
   patchConversation,
   postMessage,
+  interruptRun,
 } from "./state/api";
 import { ConversationEventStream } from "./state/events";
 import { initialState, reduceChatState } from "./state/reducer";
 import type {
   ApprovalDecision,
-  Conversation,
   CreateConversationRequest,
   RunStatus,
+  PermissionProfile,
 } from "./state/types";
 
 const ACTIVE_RUN_STATUSES = new Set<RunStatus>([
@@ -93,6 +96,9 @@ export function App() {
     : null;
   const activeApproval = activeId
     ? state.activeApprovalByConversation[activeId] ?? null
+    : null;
+  const activePlan = activeId
+    ? state.planByConversation[activeId] ?? null
     : null;
   const messagesError = activeId
     ? state.messagesErrorByConversation[activeId] ?? null
@@ -262,7 +268,21 @@ export function App() {
         }
         dispatch({ type: "event.received", event });
         sessionByConversationRef.current[conversationId] = event.session_id;
-        if (event.type === "run.completed" || event.type === "run.failed") {
+        if (
+          event.type === "approval.requested" ||
+          event.type === "approval.resolved"
+        ) {
+          void getConversationState(conversationId).then((conversationState) => {
+            if (epoch !== selectionEpochRef.current) {
+              return;
+            }
+            dispatch({
+              type: "conversation.state.loaded",
+              conversationId,
+              state: conversationState,
+            });
+          });
+        } else if (event.type === "run.completed" || event.type === "run.failed") {
           void (async () => {
             const [messagesForConversation, runsForConversation, conversationState] =
               await Promise.all([
@@ -446,6 +466,27 @@ export function App() {
     });
   }
 
+  async function handleStop(): Promise<void> {
+    if (!activeId || !activeSessionId) {
+      return;
+    }
+    await interruptRun(activeId, activeSessionId);
+    const [conversationState, runsForConversation] = await Promise.all([
+      getConversationState(activeId),
+      listRuns(activeId),
+    ]);
+    dispatch({
+      type: "runs.loaded",
+      conversationId: activeId,
+      runs: runsForConversation,
+    });
+    dispatch({
+      type: "conversation.state.loaded",
+      conversationId: activeId,
+      state: conversationState,
+    });
+  }
+
   async function handleApprovalDecision(
     approvalId: string,
     decision: ApprovalDecision,
@@ -453,19 +494,17 @@ export function App() {
     await decideApproval(approvalId, { decision });
   }
 
-  async function handlePermissionModeChange(
-    event: React.ChangeEvent<HTMLSelectElement>,
-  ): Promise<void> {
+  async function handlePermissionProfileChange(value: PermissionProfile): Promise<void> {
     if (!activeId || permissionDisabled) {
       return;
     }
-    const updated = await patchConversation(activeId, {
-      permission_mode: event.target.value as Conversation["permission_mode"],
+    const updated = await patchConversation(activeId, { permission_profile: value });
+    dispatch({
+      type: "conversations.loaded",
+      conversations: state.conversations.map((conversation) =>
+        conversation.conversation_id === activeId ? updated : conversation,
+      ),
     });
-    const conversations = state.conversations.map((conversation) =>
-      conversation.conversation_id === activeId ? updated : conversation,
-    );
-    dispatch({ type: "conversations.loaded", conversations });
   }
 
   return (
@@ -555,18 +594,11 @@ export function App() {
                   <span>{projectName(activeConversation.project_root)}</span>
                 </div>
                 <div className="chat-conversation__controls">
-                  <label className="visually-hidden" htmlFor="permission-mode">
-                    Permission mode
-                  </label>
-                  <select
-                    id="permission-mode"
-                    value={activeConversation.permission_mode}
+                  <PermissionProfileSelect
+                    value={activeConversation.permission_profile}
                     disabled={permissionDisabled}
-                    onChange={(event) => void handlePermissionModeChange(event)}
-                  >
-                    <option value="PROJECT_READ_ONLY">PROJECT_READ_ONLY</option>
-                    <option value="ASK_FOR_ACCESS">ASK_FOR_ACCESS</option>
-                  </select>
+                    onChange={(value) => void handlePermissionProfileChange(value)}
+                  />
                   <div className="chat-conversation__details">
                     <button
                       type="button"
@@ -586,6 +618,7 @@ export function App() {
                   </div>
                 </div>
               </header>
+              <PlanPanel plan={activePlan} />
               <div className="chat-timeline">
                 <MessageTimeline
                   messages={messages}
@@ -628,6 +661,8 @@ export function App() {
                 <ChatComposer
                   disabled={composerDisabled}
                   disabledReason={composerDisabledReason}
+                  stopEnabled={Boolean(activeId && isRunActive && activeSessionId)}
+                  onStop={handleStop}
                   onSubmit={handleSubmitMessage}
                 />
               </div>

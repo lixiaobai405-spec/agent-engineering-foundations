@@ -74,6 +74,20 @@ def test_builder_emits_fixed_security_argv_and_command_after_image(tmp_path: Pat
     assert argv[image_index + 1 :] == request.argv
     assert image_index < argv.index("--privileged")
     assert all("docker.sock" not in item.casefold() for item in argv)
+    assert "-e" not in argv
+
+
+def test_builder_passes_request_env_as_docker_e_flags(tmp_path: Path) -> None:
+    DockerCommandBuilder, *_ = _execution()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    request = _request(env=(("HOME", "/opt/isolated-home"), ("GIT_CONFIG_NOSYSTEM", "1")))
+    argv = DockerCommandBuilder(workspace).build(request)
+    assert argv[argv.index("-e") + 1] == "HOME=/opt/isolated-home"
+    assert "GIT_CONFIG_NOSYSTEM=1" in argv
+    assert all("Path.home" not in item for item in argv)
+    image_index = argv.index("agent-foundations-sandbox:phase2")
+    assert argv[image_index + 1 :] == request.argv
 
 
 def test_builder_uses_one_mount_argument_and_read_only_is_explicit(tmp_path: Path) -> None:
@@ -557,3 +571,22 @@ async def test_backend_missing_docker_is_unavailable_without_host_fallback(
 
     assert len(factory.argvs) == 1
     assert factory.argvs[0][:2] == ("docker", "run")
+
+
+def test_entrypoint_and_build_context() -> None:
+    root = Path(__file__).resolve().parents[3]
+    entrypoint = (root / "docker" / "sandbox-entrypoint.sh").read_text(encoding="utf-8")
+    dockerignore = (root / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    assert 'exec "$@"' in entrypoint
+    assert "eval" not in entrypoint
+    assert "sh -c" not in entrypoint
+    assert dockerignore == [
+        "**",
+        "!docker/agent-sandbox.Dockerfile",
+        "!docker/agent-sandbox-python.Dockerfile",
+        "!docker/agent-sandbox-node.Dockerfile",
+        "!docker/agent-sandbox-python.requirements.lock",
+        "!docker/sandbox-entrypoint.sh",
+        "!package.json",
+        "!package-lock.json",
+    ]

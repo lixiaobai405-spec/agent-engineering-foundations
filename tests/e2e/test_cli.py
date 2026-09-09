@@ -49,8 +49,9 @@ def test_help_shows_analyze_and_viewer_commands() -> None:
 def test_chat_help_shows_local_options() -> None:
     result = CliRunner().invoke(main.app, ["chat", "--help"])
     assert result.exit_code == 0
-    assert "--state-db" in result.output
-    assert "--trace-dir" in result.output
+    assert "--data-root" in result.output
+    assert "--state-db" not in result.output
+    assert "--trace-dir" not in result.output
     assert "--port" in result.output
     assert "--host" not in result.output
 
@@ -62,7 +63,7 @@ def test_chat_missing_api_key_returns_exit_2(
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("AGENT_API_KEY", raising=False)
     monkeypatch.setenv("AGENT_MODEL", "test-model")
-    result = CliRunner().invoke(main.app, ["chat", "--trace-dir", str(tmp_path)])
+    result = CliRunner().invoke(main.app, ["chat", "--data-root", str(tmp_path)])
     assert result.exit_code == 2
     assert "AGENT_API_KEY" in result.output
 
@@ -74,7 +75,7 @@ def test_chat_missing_model_returns_exit_2(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("AGENT_API_KEY", "test-key")
     monkeypatch.delenv("AGENT_MODEL", raising=False)
-    result = CliRunner().invoke(main.app, ["chat", "--trace-dir", str(tmp_path)])
+    result = CliRunner().invoke(main.app, ["chat", "--data-root", str(tmp_path)])
     assert result.exit_code == 2
     assert "AGENT_MODEL" in result.output
 
@@ -107,10 +108,8 @@ def test_chat_command_binds_loopback_only(
         main.app,
         [
             "chat",
-            "--state-db",
-            str(tmp_path / "chat.sqlite3"),
-            "--trace-dir",
-            str(tmp_path / "traces"),
+            "--data-root",
+            str(tmp_path),
             "--port",
             "9002",
         ],
@@ -423,12 +422,15 @@ def test_build_runtime_passes_sdk_config(
             captured.update(kwargs)
 
     monkeypatch.setattr(main, "AsyncOpenAI", FakeClient)
-    main.build_runtime(tmp_path, tmp_path / "traces", None)
+    runtime = main.build_runtime(tmp_path, tmp_path / "traces", None)
 
     assert captured["api_key"] == "test-key"
     assert captured["base_url"] == "https://custom.example/v1"
     assert captured["timeout"] == 60.0
-    assert captured["max_retries"] == 2
+    assert captured["max_retries"] == 0
+    from agent_foundations.providers.resilient import ResilientModelProvider
+
+    assert isinstance(runtime._provider, ResilientModelProvider)
 
 
 # ── Offline evaluate ─────────────────────────────────────────────────────

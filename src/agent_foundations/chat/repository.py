@@ -23,6 +23,12 @@ from agent_foundations.chat.models import (
     new_id,
     utc_now,
 )
+from agent_foundations.durable.repository import (
+    DurableRunNotFoundError,
+    DurableRunRepository,
+    DurableRunStatusConflictError,
+)
+from agent_foundations.security.models import PermissionProfileName
 from agent_foundations.storage.database import FutureSchemaVersionError, SqliteDatabase
 from agent_foundations.storage.migrations import get_application_migrations
 
@@ -51,8 +57,49 @@ _TERMINAL_RUN_STATUSES = {
 }
 
 
+async def cancel_durable_run_if_active(
+    durable_repository: DurableRunRepository | None,
+    session_id: str,
+) -> None:
+    if durable_repository is None:
+        return
+    try:
+        await durable_repository.cancel_run(session_id)
+    except DurableRunNotFoundError:
+        return
+    except DurableRunStatusConflictError:
+        return
+
+
 class UnsupportedSchemaVersionError(ChatError):
     """Raised when the on-disk schema is newer than this repository supports."""
+
+
+def permission_profile_for_mode(mode: PermissionMode) -> PermissionProfileName:
+    if mode is PermissionMode.ASK_FOR_ACCESS:
+        return PermissionProfileName.ASK_ALWAYS
+    return PermissionProfileName.PROJECT_READ_ONLY
+
+
+def permission_mode_for_profile(profile: PermissionProfileName) -> PermissionMode:
+    if profile is PermissionProfileName.ASK_ALWAYS:
+        return PermissionMode.ASK_FOR_ACCESS
+    return PermissionMode.PROJECT_READ_ONLY
+
+
+def _synchronize_permissions(
+    permission_mode: PermissionMode | None,
+    permission_profile: PermissionProfileName | None,
+) -> tuple[PermissionMode, PermissionProfileName]:
+    if permission_mode is None and permission_profile is None:
+        permission_profile = PermissionProfileName.PROJECT_READ_ONLY
+    if permission_profile is None:
+        assert permission_mode is not None
+        permission_profile = permission_profile_for_mode(permission_mode)
+    expected_mode = permission_mode_for_profile(permission_profile)
+    if permission_mode is not None and permission_mode is not expected_mode:
+        raise ValueError("permission_mode conflicts with permission_profile")
+    return expected_mode, permission_profile
 
 
 def _assert_permission_mode_change_allowed(
@@ -81,7 +128,21 @@ def _assert_permission_mode_change_allowed(
         """,
         (conversation_id,),
     ).fetchone()
-    if active_run is not None or pending_approval is not None:
+    pending_authorization = connection.execute(
+        """
+        SELECT 1
+        FROM authorization_requests AS authorization
+        JOIN runs ON runs.session_id = authorization.run_id
+        WHERE runs.conversation_id = ? AND authorization.status = 'pending'
+        LIMIT 1
+        """,
+        (conversation_id,),
+    ).fetchone()
+    if (
+        active_run is not None
+        or pending_approval is not None
+        or pending_authorization is not None
+    ):
         raise ChatConflictError(
             "permission mode cannot change while a run or approval is active",
         )
@@ -106,13 +167,15 @@ class ConversationRepository:
         *,
         title: str,
         project_root: Path,
-        permission_mode: PermissionMode,
+        permission_mode: PermissionMode | None = None,
+        permission_profile: PermissionProfileName | None = None,
     ) -> Conversation:
         return await asyncio.to_thread(
             self._create_conversation_sync,
             title,
             project_root,
             permission_mode,
+            permission_profile,
         )
 
     async def get_conversation(self, conversation_id: str) -> Conversation:
@@ -127,12 +190,14 @@ class ConversationRepository:
         *,
         title: str | None = None,
         permission_mode: PermissionMode | None = None,
+        permission_profile: PermissionProfileName | None = None,
     ) -> Conversation:
         return await asyncio.to_thread(
             self._update_conversation_sync,
             conversation_id,
             title,
             permission_mode,
+            permission_profile,
         )
 
     async def begin_run(
@@ -172,6 +237,20 @@ class ConversationRepository:
 
     async def list_messages(self, conversation_id: str) -> list[ChatMessage]:
         return await asyncio.to_thread(self._list_messages_sync, conversation_id)
+
+    async def get_message(
+        self,
+        conversation_id: str,
+        message_id: str,
+        *,
+        expected_role: MessageRole | None = None,
+    ) -> ChatMessage:
+        return await asyncio.to_thread(
+            self._get_message_sync,
+            conversation_id,
+            message_id,
+            expected_role,
+        )
 
     async def list_context_before(
         self,
@@ -214,6 +293,7 @@ class ConversationRepository:
         tool_call_id: str,
         tool_name: str,
         canonical_path: str,
+        operation: AccessOperation | None = None,
         approval_id: str | None = None,
     ) -> ApprovalRequest:
         return await asyncio.to_thread(
@@ -223,6 +303,7 @@ class ConversationRepository:
             tool_call_id,
             tool_name,
             canonical_path,
+            operation,
             approval_id,
         )
 
@@ -255,8 +336,17 @@ class ConversationRepository:
             approval_id,
         )
 
-    async def interrupt_unfinished(self) -> tuple[int, int]:
-        return await asyncio.to_thread(self._interrupt_unfinished_sync)
+    async def interrupt_unfinished(
+        self,
+        durable_repository: DurableRunRepository | None = None,
+    ) -> tuple[int, int]:
+        interrupted_runs, invalidated_approvals, session_ids = await asyncio.to_thread(
+            self._interrupt_unfinished_sync,
+        )
+        if durable_repository is not None:
+            for session_id in session_ids:
+                await cancel_durable_run_if_active(durable_repository, session_id)
+        return interrupted_runs, invalidated_approvals
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -267,14 +357,20 @@ class ConversationRepository:
         self,
         title: str,
         project_root: Path,
-        permission_mode: PermissionMode,
+        permission_mode: PermissionMode | None,
+        permission_profile: PermissionProfileName | None,
     ) -> Conversation:
         now = utc_now()
+        synchronized_mode, profile = _synchronize_permissions(
+            permission_mode,
+            permission_profile,
+        )
         conversation = Conversation(
             conversation_id=new_id(),
             title=_normalize_title(title),
             project_root=str(project_root),
-            permission_mode=permission_mode,
+            permission_mode=synchronized_mode,
+            permission_profile=profile,
             created_at=now,
             updated_at=now,
         )
@@ -286,15 +382,19 @@ class ConversationRepository:
                     title,
                     project_root,
                     permission_mode,
+                    permission_profile,
+                    profile_version,
                     created_at,
                     updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     conversation.conversation_id,
                     conversation.title,
                     conversation.project_root,
                     conversation.permission_mode.value,
+                    conversation.permission_profile.value,
+                    conversation.profile_version,
                     _serialize_datetime(conversation.created_at),
                     _serialize_datetime(conversation.updated_at),
                 ),
@@ -311,6 +411,8 @@ class ConversationRepository:
                     title,
                     project_root,
                     permission_mode,
+                    permission_profile,
+                    profile_version,
                     created_at,
                     updated_at
                 FROM conversations
@@ -331,6 +433,8 @@ class ConversationRepository:
                     title,
                     project_root,
                     permission_mode,
+                    permission_profile,
+                    profile_version,
                     created_at,
                     updated_at
                 FROM conversations
@@ -344,8 +448,9 @@ class ConversationRepository:
         conversation_id: str,
         title: str | None,
         permission_mode: PermissionMode | None,
+        permission_profile: PermissionProfileName | None = None,
     ) -> Conversation:
-        if title is None and permission_mode is None:
+        if title is None and permission_mode is None and permission_profile is None:
             return self._get_conversation_sync(conversation_id)
 
         with self._connect() as connection:
@@ -358,6 +463,8 @@ class ConversationRepository:
                         title,
                         project_root,
                         permission_mode,
+                        permission_profile,
+                        profile_version,
                         created_at,
                         updated_at
                     FROM conversations
@@ -370,37 +477,66 @@ class ConversationRepository:
 
                 current = _row_to_conversation(row)
                 next_title = current.title if title is None else _normalize_title(title)
-                next_permission_mode = (
-                    current.permission_mode
-                    if permission_mode is None
-                    else permission_mode
-                )
-                if (
-                    permission_mode is not None
-                    and permission_mode != current.permission_mode
-                ):
+                if permission_mode is None and permission_profile is None:
+                    next_permission_mode = current.permission_mode
+                    next_permission_profile = current.permission_profile
+                elif permission_profile is None:
+                    assert permission_mode is not None
+                    next_permission_profile = permission_profile_for_mode(
+                        permission_mode,
+                    )
+                    next_permission_mode = permission_mode_for_profile(
+                        next_permission_profile,
+                    )
+                else:
+                    next_permission_mode, next_permission_profile = (
+                        _synchronize_permissions(permission_mode, permission_profile)
+                    )
+                if next_permission_profile != current.permission_profile:
                     _assert_permission_mode_change_allowed(connection, conversation_id)
+                next_profile_version = current.profile_version + int(
+                    next_permission_profile != current.permission_profile
+                )
 
                 updated = current.model_copy(
                     update={
                         "title": next_title,
                         "permission_mode": next_permission_mode,
+                        "permission_profile": next_permission_profile,
+                        "profile_version": next_profile_version,
                         "updated_at": utc_now(),
                     },
                 )
                 connection.execute(
                     """
                     UPDATE conversations
-                    SET title = ?, permission_mode = ?, updated_at = ?
+                    SET title = ?, permission_mode = ?, permission_profile = ?,
+                        profile_version = ?, updated_at = ?
                     WHERE conversation_id = ?
                     """,
                     (
                         updated.title,
                         updated.permission_mode.value,
+                        updated.permission_profile.value,
+                        updated.profile_version,
                         _serialize_datetime(updated.updated_at),
                         conversation_id,
                     ),
                 )
+                if next_profile_version != current.profile_version:
+                    now_text = _serialize_datetime(updated.updated_at)
+                    connection.execute(
+                        """
+                        UPDATE authorization_requests
+                        SET status = 'invalidated', decided_at = ?
+                        WHERE run_id IN (
+                            SELECT session_id FROM runs WHERE conversation_id = ?
+                        )
+                          AND profile_version <> ?
+                          AND status IN ('pending', 'approved')
+                        """,
+                        (now_text, conversation_id, next_profile_version),
+                    )
                 connection.commit()
             except (ChatNotFoundError, ChatConflictError, ValueError):
                 connection.rollback()
@@ -768,6 +904,38 @@ class ConversationRepository:
             ).fetchall()
         return [_row_to_message(row) for row in rows]
 
+    def _get_message_sync(
+        self,
+        conversation_id: str,
+        message_id: str,
+        expected_role: MessageRole | None,
+    ) -> ChatMessage:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    message_id,
+                    conversation_id,
+                    role,
+                    content,
+                    sequence,
+                    created_at
+                FROM messages
+                WHERE message_id = ?
+                """,
+                (message_id,),
+            ).fetchone()
+        if row is None or row["conversation_id"] != conversation_id:
+            raise ChatNotFoundError(
+                f"message not found in conversation: {message_id}",
+            )
+        message = _row_to_message(row)
+        if expected_role is not None and message.role is not expected_role:
+            raise ChatNotFoundError(
+                f"message role mismatch in conversation: {message_id}",
+            )
+        return message
+
     def _list_context_before_sync(
         self,
         conversation_id: str,
@@ -1035,6 +1203,7 @@ class ConversationRepository:
         tool_call_id: str,
         tool_name: str,
         canonical_path: str,
+        operation: AccessOperation | None,
         approval_id: str | None,
     ) -> ApprovalRequest:
         now = utc_now()
@@ -1067,6 +1236,11 @@ class ConversationRepository:
                 if run.status is not RunStatus.WAITING_APPROVAL:
                     raise ChatConflictError("run must be waiting for approval")
 
+                effective_operation = operation or (
+                    AccessOperation.APPLY
+                    if tool_name == "apply_patch"
+                    else AccessOperation.READ
+                )
                 approval = ApprovalRequest(
                     approval_id=approval_id or new_id(),
                     conversation_id=conversation_id,
@@ -1074,7 +1248,7 @@ class ConversationRepository:
                     tool_call_id=tool_call_id,
                     tool_name=tool_name,
                     canonical_path=canonical_path,
-                    operation=AccessOperation.READ,
+                    operation=effective_operation,
                     status=ApprovalStatus.PENDING,
                     requested_at=now,
                 )
@@ -1258,7 +1432,7 @@ class ConversationRepository:
                 raise
         return updated
 
-    def _interrupt_unfinished_sync(self) -> tuple[int, int]:
+    def _interrupt_unfinished_sync(self) -> tuple[int, int, tuple[str, ...]]:
         now = utc_now()
         now_text = _serialize_datetime(now)
         active_statuses = tuple(status.value for status in RunStatus.active())
@@ -1266,6 +1440,15 @@ class ConversationRepository:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                session_rows = connection.execute(
+                    f"""
+                    SELECT session_id
+                    FROM runs
+                    WHERE status IN ({placeholders})
+                    """,
+                    active_statuses,
+                ).fetchall()
+                session_ids = tuple(str(row["session_id"]) for row in session_rows)
                 connection.execute(
                     f"""
                     UPDATE chat_tool_activities
@@ -1304,7 +1487,7 @@ class ConversationRepository:
             except sqlite3.Error:
                 connection.rollback()
                 raise
-        return interrupted_runs, invalidated_approvals
+        return interrupted_runs, invalidated_approvals, session_ids
 
 
 def _trace_path_for_session(session_id: str) -> str:
@@ -1437,6 +1620,8 @@ def _row_to_conversation(row: sqlite3.Row) -> Conversation:
         title=row["title"],
         project_root=row["project_root"],
         permission_mode=PermissionMode(row["permission_mode"]),
+        permission_profile=PermissionProfileName(row["permission_profile"]),
+        profile_version=row["profile_version"],
         created_at=_deserialize_datetime(row["created_at"]),
         updated_at=_deserialize_datetime(row["updated_at"]),
     )

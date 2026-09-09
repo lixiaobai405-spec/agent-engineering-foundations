@@ -35,8 +35,8 @@ def _require_application_migrations() -> None:
     from agent_foundations.storage.migrations import get_application_migrations
 
     migrations = get_application_migrations()
-    assert len(migrations) == 7
-    assert migrations[-1].version == 7
+    assert len(migrations) == 10
+    assert migrations[-1].version == 10
 
 
 def _tables(connection: sqlite3.Connection) -> set[str]:
@@ -232,7 +232,7 @@ async def test_empty_database_migrates_v1_v2_v3(tmp_path: Path) -> None:
     database = SqliteDatabase(path, get_application_migrations())
     await database.initialize()
     with database.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
         assert _tables(connection) >= {
             "conversations",
             "messages",
@@ -254,15 +254,27 @@ async def test_v2_database_upgrades_to_v3_preserving_chat_data(tmp_path: Path) -
     preserved = _create_real_v2_database(path)
     repository = await _open_repository(path)
     with repository._database.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
         assert _tables(connection) >= {"durable_runs", "run_checkpoints"}
         preserved_after = {
             table: [
                 tuple(row)
-                for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid")
+                for row in connection.execute(
+                    (
+                        "SELECT conversation_id, title, project_root, permission_mode, "
+                        "created_at, updated_at FROM conversations ORDER BY rowid"
+                        if table == "conversations"
+                        else f"SELECT * FROM {table} ORDER BY rowid"
+                    ),
+                )
             ]
             for table in preserved["v1_rows"]
         }
+        profile_row = tuple(
+            connection.execute(
+                "SELECT permission_profile, profile_version FROM conversations",
+            ).fetchone()
+        )
         activity_rows = [
             tuple(row)
             for row in connection.execute(
@@ -271,6 +283,7 @@ async def test_v2_database_upgrades_to_v3_preserving_chat_data(tmp_path: Path) -
         ]
         indexes = _indexes(connection)
     assert preserved_after == preserved["v1_rows"]
+    assert profile_row == ("PROJECT_READ_ONLY", 1)
     assert activity_rows == preserved["activity_rows"]
     assert "idx_chat_tool_activities_session_started" in indexes
     assert preserved["indexes"] <= indexes
@@ -287,7 +300,7 @@ async def test_conversation_repository_opens_v3_database(tmp_path: Path) -> None
     chat = ConversationRepository(path)
     await chat.initialize()
     with chat._connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
 
 
 @pytest.mark.asyncio
@@ -583,7 +596,7 @@ async def test_v3_database_upgrades_to_v4_preserving_durable_data(tmp_path: Path
         ]
     await repository.initialize()
     with repository._database.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
         assert "run_leases" in _tables(connection)
         assert "idx_run_leases_active_run" in _indexes(connection)
         assert "idx_run_leases_run_acquired" in _indexes(connection)
@@ -607,7 +620,7 @@ async def test_initialize_rejects_future_user_version(tmp_path: Path) -> None:
 
     repository = await _open_repository(tmp_path / "chat.sqlite3")
     with repository._database.connect() as connection:
-        connection.execute("PRAGMA user_version = 8")
+        connection.execute("PRAGMA user_version = 11")
         connection.commit()
     with pytest.raises(FutureSchemaVersionError):
         await repository.initialize()

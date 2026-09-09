@@ -9,6 +9,7 @@ import type {
   ChatMessage,
   ChatToolActivity,
   Conversation,
+  ConversationStateResponse,
   RunRecord,
 } from "../../web/chat/state/types";
 
@@ -34,6 +35,7 @@ vi.mock("../../web/chat/state/api", async () => {
     getRun: vi.fn(),
     getConversationState: vi.fn(),
     decideApproval: vi.fn(),
+    interruptRun: vi.fn(),
   };
 });
 
@@ -85,6 +87,8 @@ const CONVERSATION_A: Conversation = {
   title: "Runtime study",
   project_root: "D:\\canonical\\project",
   permission_mode: "PROJECT_READ_ONLY",
+  permission_profile: "PROJECT_READ_ONLY",
+  profile_version: 1,
   created_at: "2026-08-02T00:00:00Z",
   updated_at: "2026-08-02T00:00:00Z",
 };
@@ -94,6 +98,8 @@ const CONVERSATION_B: Conversation = {
   title: "External access",
   project_root: "D:\\canonical\\other",
   permission_mode: "ASK_FOR_ACCESS",
+  permission_profile: "ASK_ALWAYS",
+  profile_version: 1,
   created_at: "2026-08-02T00:00:01Z",
   updated_at: "2026-08-02T00:00:01Z",
 };
@@ -126,6 +132,37 @@ function assistantCompletedEvent(content: string): ChatEvent {
       message_id: "bbbb0000-0000-4000-8000-000000000002",
       content,
       sequence: 2,
+    },
+  };
+}
+
+function pendingReadState(): ConversationStateResponse {
+  return {
+    latest_run: {
+      session_id: "33333333-3333-4333-8333-333333333333",
+      conversation_id: CONVERSATION_A.conversation_id,
+      user_message_id: MESSAGE_USER.message_id,
+      trace_path: "traces/approval.jsonl",
+      assistant_message_id: null,
+      status: "waiting_approval",
+      error_code: null,
+      created_at: "2026-08-02T00:00:00Z",
+      started_at: "2026-08-02T00:00:01Z",
+      finished_at: null,
+    },
+    pending_approval: {
+      approval_id: "44444444-4444-4444-8444-444444444444",
+      conversation_id: CONVERSATION_A.conversation_id,
+      session_id: "33333333-3333-4333-8333-333333333333",
+      tool_call_id: "call-1",
+      tool_name: "read_file",
+      canonical_path: "/tmp/external.txt",
+      operation: "read",
+      resource_kind: "project_path",
+      scope: "external_exact_path",
+      policy_decision: "ask",
+      status: "pending",
+      requested_at: "2026-08-02T00:00:01Z",
     },
   };
 }
@@ -186,7 +223,7 @@ describe("App", () => {
     expect(screen.queryByText("Example assistant")).not.toBeInTheDocument();
   });
 
-  it("requires title, project_root, and permission_mode to create a conversation", async () => {
+  it("requires title, project_root, and permission_profile to create a conversation", async () => {
     const user = userEvent.setup();
     render(<App />);
     await user.click(await screen.findByRole("button", { name: "New conversation" }));
@@ -212,7 +249,7 @@ describe("App", () => {
     await user.click(await screen.findByRole("button", { name: "New conversation" }));
     await user.type(screen.getByLabelText("Title"), "Runtime study");
     await user.type(screen.getByLabelText("Project root"), "D:\\raw\\input");
-    await user.selectOptions(screen.getByLabelText("Permission mode"), "PROJECT_READ_ONLY");
+    await user.selectOptions(screen.getByLabelText("Permission profile"), "PROJECT_READ_ONLY");
     await user.click(screen.getByRole("button", { name: "Create conversation" }));
 
     await waitFor(() => {
@@ -473,6 +510,7 @@ describe("App", () => {
     await waitFor(() => {
       expect(MockEventSource.instances.length).toBe(1);
     });
+    vi.mocked(api.getConversationState).mockResolvedValue(pendingReadState());
 
     latestEventSource().emit("approval.requested", {
       approval_id: "44444444-4444-4444-8444-444444444444",
@@ -489,6 +527,67 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Approve once" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Deny" })).toBeDisabled();
     expect(await screen.findByRole("alert")).toHaveTextContent("conflict");
+  });
+
+  it("uses approval SSE only to refetch and render HTTP patch truth", async () => {
+    vi.mocked(api.listConversations).mockResolvedValue([CONVERSATION_A]);
+    render(<App />);
+    await waitFor(() => expect(MockEventSource.instances.length).toBe(1));
+    vi.mocked(api.getConversationState).mockClear();
+    vi.mocked(api.getConversationState).mockResolvedValue({
+      latest_run: {
+        session_id: "33333333-3333-4333-8333-333333333333",
+        conversation_id: CONVERSATION_A.conversation_id,
+        user_message_id: MESSAGE_USER.message_id,
+        trace_path: "traces/patch.jsonl",
+        assistant_message_id: null,
+        status: "waiting_approval",
+        error_code: null,
+        created_at: "2026-08-02T00:00:00Z",
+        started_at: "2026-08-02T00:00:01Z",
+        finished_at: null,
+      },
+      pending_approval: {
+        approval_id: "44444444-4444-4444-8444-444444444444",
+        conversation_id: CONVERSATION_A.conversation_id,
+        session_id: "33333333-3333-4333-8333-333333333333",
+        tool_call_id: "apply-call",
+        tool_name: "apply_patch",
+        canonical_path: "patch:0123456789abcdef",
+        operation: "apply",
+        resource_kind: "project_path",
+        scope: "project_internal",
+        policy_decision: "ask",
+        status: "pending",
+        requested_at: "2026-08-02T00:00:01Z",
+      },
+      patch_preview: {
+        patch_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        files: [
+          {
+            path: "README.md",
+            operation: "modify",
+            hunk_count: 1,
+            baseline_status: "matched",
+            summary: "+1 -1",
+          },
+        ],
+      },
+    });
+
+    latestEventSource().emit("approval.requested", {
+      approval_id: "event-only-id",
+      tool_call_id: "event-only-call",
+      tool_name: "apply_patch",
+      canonical_path: "patch:event-only",
+      operation: "apply",
+      scope: "project_internal",
+    });
+
+    await waitFor(() => expect(api.getConversationState).toHaveBeenCalledTimes(1));
+    expect(await screen.findByRole("region", { name: "Patch preview" })).toBeInTheDocument();
+    expect(screen.getByText(/README\.md/)).toBeInTheDocument();
+    expect(screen.queryByText("event-only-id")).not.toBeInTheDocument();
   });
 
   it("prevents duplicate approval API calls on rapid clicks", async () => {
@@ -517,6 +616,7 @@ describe("App", () => {
     await waitFor(() => {
       expect(MockEventSource.instances.length).toBe(1);
     });
+    vi.mocked(api.getConversationState).mockResolvedValue(pendingReadState());
     latestEventSource().emit("approval.requested", {
       approval_id: "44444444-4444-4444-8444-444444444444",
       tool_call_id: "call-1",
@@ -533,28 +633,30 @@ describe("App", () => {
     resolveDecision?.();
   });
 
-  it("allows permission mode updates only while idle", async () => {
+  it("allows permission profile updates only while idle", async () => {
     const user = userEvent.setup();
     vi.mocked(api.listConversations).mockResolvedValue([CONVERSATION_A]);
     vi.mocked(api.patchConversation).mockResolvedValue({
       ...CONVERSATION_A,
       permission_mode: "ASK_FOR_ACCESS",
+      permission_profile: "ASK_ALWAYS",
+      profile_version: 2,
     });
 
     render(<App />);
-    const permissionSelect = await screen.findByLabelText("Permission mode");
+    const permissionSelect = await screen.findByLabelText("Permission profile");
     expect(permissionSelect).toBeEnabled();
-    await user.selectOptions(permissionSelect, "ASK_FOR_ACCESS");
+    await user.selectOptions(permissionSelect, "ASK_ALWAYS");
     await waitFor(() => {
       expect(api.patchConversation).toHaveBeenCalledWith(CONVERSATION_A.conversation_id, {
-        permission_mode: "ASK_FOR_ACCESS",
+        permission_profile: "ASK_ALWAYS",
       });
     });
 
     latestEventSource().emit("run.started", { status: "running" });
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
-      expect(screen.getByLabelText("Permission mode")).toBeDisabled();
+      expect(screen.getByLabelText("Permission profile")).toBeDisabled();
     });
   });
 
@@ -670,7 +772,7 @@ describe("App", () => {
     await waitFor(() => expect(listActivitiesMock).toHaveBeenCalledTimes(3));
   });
 
-  it("disables composer and permission mode for recovered running state", async () => {
+  it("disables composer and permission profile for recovered running state", async () => {
     vi.mocked(api.listConversations).mockResolvedValue([CONVERSATION_A]);
     vi.mocked(api.listMessages).mockResolvedValue([MESSAGE_USER]);
     vi.mocked(api.getConversationState).mockResolvedValue({
@@ -692,7 +794,50 @@ describe("App", () => {
     render(<App />);
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
-      expect(screen.getByLabelText("Permission mode")).toBeDisabled();
+      expect(screen.getByLabelText("Permission profile")).toBeDisabled();
+    });
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeInTheDocument();
+  });
+
+  it("calls interrupt API from Stop and refreshes interrupted run state", async () => {
+    const user = userEvent.setup();
+    const running = {
+      session_id: "session-running",
+      conversation_id: CONVERSATION_A.conversation_id,
+      user_message_id: MESSAGE_USER.message_id,
+      trace_path: "traces/session-running.jsonl",
+      assistant_message_id: null,
+      status: "running" as const,
+      error_code: null,
+      created_at: "2026-08-02T00:00:00Z",
+      started_at: "2026-08-02T00:00:01Z",
+      finished_at: null,
+    };
+    const interrupted = {
+      ...running,
+      status: "interrupted" as const,
+      finished_at: "2026-08-02T00:00:02Z",
+    };
+    vi.mocked(api.listConversations).mockResolvedValue([CONVERSATION_A]);
+    vi.mocked(api.listMessages).mockResolvedValue([MESSAGE_USER]);
+    vi.mocked(api.getConversationState)
+      .mockResolvedValueOnce({ latest_run: running, pending_approval: null })
+      .mockResolvedValue({ latest_run: interrupted, pending_approval: null });
+    vi.mocked(api.interruptRun).mockResolvedValue(interrupted);
+    listRunsMock.mockResolvedValue([interrupted]);
+
+    render(<App />);
+    const stop = await screen.findByRole("button", { name: "Stop" });
+    await user.click(stop);
+    await waitFor(() => {
+      expect(api.interruptRun).toHaveBeenCalledWith(
+        CONVERSATION_A.conversation_id,
+        "session-running",
+      );
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled();
     });
   });
 
@@ -720,7 +865,9 @@ describe("App", () => {
         tool_name: "read_file",
         canonical_path: "/tmp/external.txt",
         operation: "read",
+        resource_kind: "project_path",
         scope: "external_exact_path",
+        policy_decision: "ask",
         status: "pending",
         requested_at: "2026-08-02T00:00:01Z",
       },
@@ -733,7 +880,8 @@ describe("App", () => {
     expect(within(card).getByText("read")).toBeInTheDocument();
     expect(within(card).getByText("external exact path")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
-    expect(screen.getByLabelText("Permission mode")).toBeDisabled();
+    expect(screen.getByLabelText("Permission profile")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeEnabled();
     expect(document.body.textContent).not.toContain("recovered-approval-");
     expect(document.body.textContent).not.toContain("1970-01-01T00:00:00Z");
   });
@@ -781,7 +929,7 @@ describe("App", () => {
     render(<App />);
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled();
-      expect(screen.getByLabelText("Permission mode")).toBeEnabled();
+      expect(screen.getByLabelText("Permission profile")).toBeEnabled();
       expect(
         screen.getByRole("link", { name: "Open trace for this turn" }),
       ).toHaveAttribute(
@@ -789,6 +937,7 @@ describe("App", () => {
         `/trace?conversation_id=${CONVERSATION_A.conversation_id}&session_id=session-done`,
       );
     });
+    expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument();
   });
 
   it("shows accessible error when conversation state recovery fails", async () => {
@@ -873,7 +1022,7 @@ describe("App", () => {
 
     expect(await screen.findByRole("heading", { name: "Runtime study" })).toBeInTheDocument();
     expect(screen.getByText("project")).toBeInTheDocument();
-    expect(screen.getByLabelText("Permission mode")).toBeInTheDocument();
+    expect(screen.getByLabelText("Permission profile")).toBeInTheDocument();
     const detailsButton = screen.getByRole("button", { name: "Conversation details" });
     expect(detailsButton).toBeInTheDocument();
     expect(within(detailsButton.parentElement as HTMLElement).getByText(

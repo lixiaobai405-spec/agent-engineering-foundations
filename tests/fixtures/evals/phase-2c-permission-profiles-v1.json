@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "dataset_id": "phase-2c-permission-profiles",
+  "dataset_version": "v1",
+  "forbidden_tools": ["run_command", "git_status", "git_diff", "git_log"],
+  "cases": [
+    {
+      "profile": "PROJECT_READ_ONLY",
+      "profile_version": 11,
+      "expected_write_decision": "deny",
+      "apply_patch_exposed": false
+    },
+    {
+      "profile": "ASK_ALWAYS",
+      "profile_version": 12,
+      "expected_write_decision": "ask",
+      "apply_patch_exposed": true
+    },
+    {
+      "profile": "RISK_BASED",
+      "profile_version": 13,
+      "expected_write_decision": "ask",
+      "apply_patch_exposed": true
+    },
+    {
+      "profile": "PROJECT_FULL_ACCESS",
+      "profile_version": 14,
+      "expected_write_decision": "allow",
+      "apply_patch_exposed": true
+    },
+    {
+      "profile": "CUSTOM",
+      "profile_version": 15,
+      "expected_write_decision": "deny",
+      "apply_patch_exposed": false
+    }
+  ]
+}

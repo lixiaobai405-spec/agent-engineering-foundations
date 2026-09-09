@@ -257,3 +257,41 @@ async def test_supervisor_shutdown_rejects_start_during_and_after_shutdown() -> 
     with pytest.raises(ChatConflictError):
         await supervisor.start("conversation-a", third_run)
     assert third_factory_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_supervisor_cancel_stops_one_conversation_without_closing() -> None:
+    RunSupervisor = _require_supervisor()
+    supervisor = RunSupervisor()
+    started_a = asyncio.Event()
+    started_b = asyncio.Event()
+
+    async def hang_a() -> None:
+        started_a.set()
+        await asyncio.Event().wait()
+
+    async def hang_b() -> None:
+        started_b.set()
+        await asyncio.Event().wait()
+
+    await supervisor.start("conversation-a", hang_a)
+    await supervisor.start("conversation-b", hang_b)
+    await started_a.wait()
+    await started_b.wait()
+    assert hasattr(supervisor, "cancel")
+    await supervisor.cancel("conversation-a")
+    assert supervisor.is_active("conversation-a") is False
+    assert supervisor.is_active("conversation-b") is True
+
+    restarted = asyncio.Event()
+
+    async def hang_again() -> None:
+        restarted.set()
+        await asyncio.Event().wait()
+
+    await supervisor.start("conversation-a", hang_again)
+    await restarted.wait()
+    assert supervisor.is_active("conversation-a") is True
+    await supervisor.shutdown()
+    assert supervisor.is_active("conversation-a") is False
+    assert supervisor.is_active("conversation-b") is False

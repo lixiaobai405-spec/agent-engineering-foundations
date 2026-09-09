@@ -1,0 +1,8 @@
+============================= test session starts ==============================
+collected 2 items
+tests/test_a.py::test_one FAILED
+tests/test_a.py::test_two FAILED
+=========================== short test summary info ============================
+FAILED tests/test_a.py::test_one - assert False
+FAILED tests/test_a.py::test_two - assert False
+============================== 2 failed in 0.08s ===============================

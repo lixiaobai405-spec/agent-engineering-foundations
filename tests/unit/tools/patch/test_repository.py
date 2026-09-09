@@ -159,6 +159,6 @@ async def test_v5_to_v6_migration_preserves_data(tmp_path: Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type='table'",
             )
         }
-    assert version == 7
+    assert version == 10
     assert "patch_proposals" in tables
     assert "side_effects" in tables
